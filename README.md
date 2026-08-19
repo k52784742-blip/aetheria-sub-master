@@ -10,10 +10,11 @@
 
 - [✨ 核心功能](#-核心功能)
 - [🏗️ 架构](#️-架构)
-- [🚀 部署教程（三种方式任选）](#-部署教程三种方式任选)
-  - [方式一：Wrangler CLI（推荐）](#方式一wrangler-cli推荐)
+- [🚀 部署教程（四种方式任选）](#-部署教程四种方式任选)
+  - [方式一：Wrangler CLI（保姆级）](#方式一wrangler-cli推荐保姆级教程)
   - [方式二：Cloudflare Dashboard 网页](#方式二cloudflare-dashboard-网页)
   - [方式三：GitHub Actions 自动部署](#方式三github-actions-自动部署)
+  - [方式四：VPS 服务器部署](#方式四vps-服务器部署自建服务器方案)
 - [⚙️ 初始化配置](#️-初始化配置)
 - [📚 常用命令速查](#-常用命令速查)
 - [💬 买家使用指南](#-买家使用指南)
@@ -78,7 +79,7 @@ Cloudflare Workers
 
 ---
 
-## 🚀 部署教程（三种方式任选）
+## 🚀 部署教程（四种方式任选）
 
 ### 准备阶段（所有方式通用）
 
@@ -92,92 +93,144 @@ Cloudflare Workers
 
 ---
 
-### 方式一：Wrangler CLI（推荐）
+### 方式一：Wrangler CLI（推荐，保姆级教程）
 
-适合本地开发部署，功能最全。
+适合本地开发部署，功能最全。下面每一步都写到**你照着做就能成功**的程度。
 
-#### 1. 安装依赖
+#### 1️⃣ 安装 Node.js（Windows/Mac/Linux）
 
+**Windows 用户：**
+1. 打开浏览器访问 https://nodejs.org
+2. 点击下载 **LTS 版本**（左边的按钮，比如 v18.x）
+3. 双击下载的 `.msi` 文件，一路点"下一步"安装
+4. 安装完成后，**重新打开** PowerShell 终端
+
+**验证是否安装成功**（在终端输入）：
 ```bash
-# 安装 Node.js (https://nodejs.org 下载 LTS 版)
 node --version
+npm --version
+```
+> 看到类似 `v18.20.0` 和 `10.7.0` 就成功了。
+> 如果提示"不是内部或外部命令"，说明没装好，重装一次。
 
-# 安装 Wrangler CLI
+#### 2️⃣ 安装 Wrangler CLI
+
+在终端输入：
+```bash
 npm install -g wrangler
+```
+> 等待出现 `added xxx packages` 就是成功。
+> 如果报权限错误（Linux/Mac），前面加 `sudo`：`sudo npm install -g wrangler`
 
-# 验证
+验证：
+```bash
 wrangler --version
 ```
 
-#### 2. 获取代码
+#### 3️⃣ 获取项目代码
 
+**方法 A：用 git（推荐）**
 ```bash
 git clone https://github.com/k52784742-blip/aetheria-sub-master.git
 cd aetheria-sub-master
 ```
 
-#### 3. 配置
+**方法 B：直接下载 ZIP**
+1. 打开 https://github.com/k52784742-blip/aetheria-sub-master
+2. 点绿色按钮 **Code** → **Download ZIP**
+3. 解压到一个文件夹（比如 `D:\aetheria`）
+4. 在解压后的文件夹里打开终端
 
+> 💡 Windows 用户在文件夹地址栏输入 `cmd` 或 `powershell` 回车即可打开终端
+
+#### 4️⃣ 复制配置文件
+
+在项目文件夹的终端里输入：
 ```bash
-# 复制配置模板
+# Windows 用户（PowerShell）
+copy wrangler.toml.example wrangler.toml
+copy .dev.vars.example .dev.vars
+
+# Mac/Linux 用户
 cp wrangler.toml.example wrangler.toml
 cp .dev.vars.example .dev.vars
 ```
 
-编辑 `wrangler.toml`：
+#### 5️⃣ 编辑配置文件（关键！）
 
-```toml
-name = "aetheria-sub-master"
-main = "worker.js"
-compatibility_date = "2026-08-19"
-workers_dev = false
+用**记事本**（Windows）或 VS Code 打开 `wrangler.toml`，修改这些内容：
 
-[vars]
-ADMIN_BOT_TOKEN = "你的管理Bot Token"
-STORE_BOT_TOKEN = "你的前台Bot Token"
-ADMIN_ID = "你的Telegram数字ID"
-DEFAULT_UPSTREAM_URL = "你的默认上游链接"
-# 可选：Webhook 安全校验密钥
-# WEBHOOK_SECRET = "随机字符串"
+| 配置项 | 填什么 | 去哪找 |
+|--------|--------|--------|
+| `ADMIN_BOT_TOKEN` | 你的**管理 Bot** Token | 找 @BotFather → `/mybots` → 选管理Bot → API Token |
+| `STORE_BOT_TOKEN` | 你的**前台 Bot** Token | 同上，选前台 Bot |
+| `ADMIN_ID` | 你的 Telegram 数字 ID | 找 @userinfobot 发任意消息 |
+| `DEFAULT_UPSTREAM_URL` | 你的订阅链接 | 你的机场/上游提供的链接 |
+| `YOUR_KV_NAMESPACE_ID` | 第 7 步创建后填 | 见下方第 7 步 |
 
-# 自定义域名路由（可选，没有就删掉这段）
-routes = [
-  { pattern = "你的域名.com", custom_domain = true }
-]
+修改后保存（记事本 `Ctrl+S`）。
 
-[triggers]
-crons = ["0 0 * * *", "0 8 * * *"]
+#### 6️⃣ 登录 Cloudflare
 
-[[kv_namespaces]]
-binding = "SUB_STORE"
-id = "YOUR_KV_NAMESPACE_ID"
+在终端输入：
+```bash
+wrangler login
 ```
+> 会自动打开浏览器，登录你的 Cloudflare 账号，点 **Allow** 授权。
+> 如果浏览器没打开，复制终端里显示的网址手动打开。
 
-#### 4. 登录并创建 KV
+#### 7️⃣ 创建 KV 存储空间
 
 ```bash
-# 登录 Cloudflare
-wrangler login
-
-# 创建 KV Namespace（记下返回的 ID 填入 wrangler.toml）
 wrangler kv namespace create SUB_STORE
 ```
+> 会返回一串 ID，类似：
+> ```
+> id = "87ae5157747f4cc1a98509e006787695"
+> ```
+> **复制这串 ID**，回到 `wrangler.toml`，把 `id = "YOUR_KV_NAMESPACE_ID"` 里的 `YOUR_KV_NAMESPACE_ID` 替换成这串 ID，保存。
 
-#### 5. 部署
+#### 8️⃣ 部署上线（核心一步）
 
 ```bash
 wrangler deploy
 ```
+> 看到类似输出就是成功：
+> ```
+> Uploaded aetheria-sub-master (3.2 sec)
+> Deployed aetheria-sub-master triggers
+>   https://你的worker名.你的账号.workers.dev
+> ```
+> 记下这个 `https://...workers.dev` 网址，后面要用。
 
-#### 6. 注册 Webhook
+#### 9️⃣ 注册 Webhook（最后一步）
 
-浏览器访问（将域名替换为你的）：
-
+打开浏览器，访问：
 ```
-https://你的域名/setup-webhooks
+https://你的worker名.你的账号.workers.dev/setup-webhooks
 ```
+> 页面显示：
+> ```json
+> {
+>   "store_bot": { "ok": true },
+>   "admin_bot": { "ok": true }
+> }
+> ```
+> 两个 `"ok": true` 就是全部成功！
 
-看到 `"ok": true` 表示两个 Bot 的 Webhook 注册成功。
+#### 🔟 开始使用
+
+打开你的**管理 Bot**，发送任意消息，就能看到管理菜单了！
+先按"初始化配置"章节完成设置，然后就能开始营业。
+
+#### 常见问题（方式一）
+
+| 问题 | 解决 |
+|------|------|
+| `wrangler login` 后没反应 | 检查浏览器是否登录了 Cloudflare |
+| `wrangler deploy` 报错 | 确认 `wrangler.toml` 的 ID 填对了没 |
+| Webhook 显示 false | 确认访问的是 `https://` 不是 `http://` |
+| 部署成功但 Bot 没反应 | 重新访问一次 `/setup-webhooks` |
 
 ---
 
@@ -321,6 +374,165 @@ jobs:
 #### 3. 推送触发部署
 
 之后每次 `git push` 到 main 分支都会自动部署。
+
+---
+
+### 方式四：VPS 服务器部署（自建服务器方案）
+
+> 适合：已有 VPS 服务器、需要完全掌控、或 Cloudflare 免费额度不够的情况。
+> 本方式需要一台 Linux 服务器（推荐 Ubuntu 22.04），成本约 ¥30-50/月。
+
+#### 1. 准备服务器
+
+**购买服务器**（任选一家）：
+- 腾讯云/阿里云：国内服务器，需备案
+- Vultr / DigitalOcean / Bandwagon：海外服务器，免备案（推荐）
+
+**推荐配置**：1 核 CPU / 1GB 内存 / 20GB 硬盘（最低档即可）
+
+**服务器系统**：选择 **Ubuntu 22.04 LTS**
+
+**登录服务器**（Windows 用户用 PowerShell）：
+```bash
+ssh root@你的服务器IP
+# 输入密码后进入服务器
+```
+
+#### 2. 安装 Node.js 环境
+
+在服务器上依次执行：
+
+```bash
+# 1. 更新系统
+apt update && apt upgrade -y
+
+# 2. 安装 Node.js 18+（用官方源）
+curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+apt install -y nodejs
+
+# 3. 验证
+node --version
+npm --version
+```
+
+#### 3. 获取项目代码
+
+```bash
+# 安装 git
+apt install -y git
+
+# 克隆项目
+git clone https://github.com/k52784742-blip/aetheria-sub-master.git
+cd aetheria-sub-master
+```
+
+#### 4. 配置环境变量
+
+```bash
+# 复制配置模板
+cp wrangler.toml.example wrangler.toml
+
+# 编辑配置（用 nano 编辑器）
+nano wrangler.toml
+```
+
+把里面的值改成你的真实信息，然后 `Ctrl+X` → `Y` → 回车 保存。
+
+#### 5. 安装 Node 运行依赖
+
+项目纯 JS 无第三方依赖，但为了用 `node` 直接运行 Worker，需要一个小工具：
+
+```bash
+npm init -y
+npm install wrangler
+```
+
+#### 6. 创建 KV 存储（本地模拟）
+
+```bash
+# 初始化本地 KV
+npx wrangler dev --local
+# 看到 "Ready" 后按 Ctrl+C 停止
+```
+
+#### 7. 启动服务
+
+**方式 A：直接运行（测试用）**
+```bash
+node server.js
+```
+
+**方式 B：使用 PM2 常驻运行（推荐）**
+```bash
+# 安装 PM2
+npm install -g pm2
+
+# 启动服务
+pm2 start server.js --name aetheria
+
+# 设置开机自启
+pm2 startup
+pm2 save
+```
+
+#### 8. 配置 Nginx 反向代理（可选但推荐）
+
+```bash
+# 安装 Nginx
+apt install -y nginx
+
+# 创建配置
+nano /etc/nginx/sites-available/aetheria
+```
+
+粘贴以下内容（替换你的域名）：
+
+```nginx
+server {
+    listen 80;
+    server_name 你的域名.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+```bash
+# 启用配置
+ln -s /etc/nginx/sites-available/aetheria /etc/nginx/sites-enabled/
+nginx -t
+systemctl restart nginx
+```
+
+#### 9. 配置 SSL 证书（HTTPS，Telegram 要求）
+
+```bash
+# 安装 certbot
+apt install -y certbot python3-certbot-nginx
+
+# 申请证书（自动配置 Nginx）
+certbot --nginx -d 你的域名.com
+```
+
+#### 10. 注册 Webhook
+
+浏览器访问：`https://你的域名/setup-webhooks`
+
+看到 `"ok": true` 表示成功。
+
+#### VPS 方案 vs 免费方案对比
+
+| 对比项 | 免费方案（Cloudflare） | VPS 方案 |
+|--------|----------------------|----------|
+| 费用 | **¥0** | ¥30-50/月 |
+| 部署难度 | 简单 | 较复杂 |
+| 维护 | 无需维护 | 需更新系统/安全 |
+| 网络 | 全球 CDN 节点 | 取决于机房位置 |
+| 适合 | 个人起步 | 业务量大/需要掌控 |
+| Telegram 连通性 | 偶尔被墙 | 海外机房稳定 |
 
 ---
 

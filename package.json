@@ -1,0 +1,15 @@
+{
+  "name": "aetheria-sub-master",
+  "version": "1.0.0",
+  "description": "AETHERIA 双 Bot 商业级自动化订阅分销系统 - VPS 运行版",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
