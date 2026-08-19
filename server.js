@@ -18,7 +18,7 @@
 import { createServer } from "http";
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -88,7 +88,10 @@ const SUB_STORE = new LocalKV();
 // ===== 加载 Worker =====
 async function loadWorker() {
   try {
-    const mod = await import(path.join(__dirname, "worker.js"));
+    // 注意：ESM 动态 import 在 Windows 上必须用 file:// URL，否则报
+    // "Only URLs with a scheme in: file, data, and node are supported"
+    const workerPath = pathToFileURL(path.join(__dirname, "worker.js")).href;
+    const mod = await import(workerPath);
     return mod.default;
   } catch (e) {
     console.error("加载 worker.js 失败:", e.message);

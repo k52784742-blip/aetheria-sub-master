@@ -174,7 +174,7 @@ async function sendDailyReport(env) {
       `🔄 昨日续费: ${yesterdayRenew} 单\n` +
       `🎫 昨日卡密: ${yesterdayCard} 单\n` +
       `🧾 历史总单: ${totalOrders} 笔\n\n` +
-      `👥 当前用户: ${users.keys.length}\n` +
+      `👥 当前用户: ${userKeys.length}\n` +
       `　🟢 正常: ${active} | ⏳ 过期: ${expired} | 🔴 禁用: ${disabled}\n` +
       `⚠️ 7天内到期: ${expiring7.length} 人\n` +
       `🎫 卡密库存: ${cardUnused} 张`;
@@ -1258,11 +1258,12 @@ async function handleStoreBot(request, env) {
 // 主菜单
 const MAIN_MENU = {
   keyboard: [
-    [{ text: "👥 用户管理" }, { text: "📦 订单管理" }],
-    [{ text: "🎫 卡密管理" }, { text: "📊 系统概览" }],
-    [{ text: "⚙️ 系统设置" }, { text: "📣 群发通知" }],
-    [{ text: "💰 分销系统" }, { text: "📜 操作日志" }],
-    [{ text: "❓ 帮助说明" }]
+    [{ text: "➕ 手动开卡" }, { text: "🔎 搜索用户" }],
+    [{ text: "📊 用户统计" }, { text: "⏳ 即将到期" }],
+    [{ text: "📤 导出名单" }, { text: "📦 订单管理" }],
+    [{ text: "🎫 卡密管理" }, { text: "⚙️ 系统设置" }],
+    [{ text: "💰 分销系统" }, { text: "📣 群发通知" }],
+    [{ text: "📜 操作日志" }, { text: "❓ 帮助说明" }]
   ],
   resize_keyboard: true,
   persistent: true
@@ -2270,66 +2271,27 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // 主菜单按钮：用户管理
-    if (text === "👥 用户管理") {
-      const userMenu = {
-        keyboard: [
-          [{ text: "📋 用户列表" }, { text: "🔍 查找用户" }],
-          [{ text: "📊 用户统计" }, { text: "⏳ 即将到期" }],
-          [{ text: "🔎 搜索用户" }, { text: "➕ 手动开卡" }],
-          [{ text: "⏱️ 调整时长" }, { text: "🎯 分配上游" }],
-          [{ text: "📝 用户备注" }, { text: "💬 私信用户" }],
-          [{ text: "�️ 删除用户" }, { text: "📤 导出名单" }],
-          [{ text: "🏠 返回主菜单" }]
-        ],
-        resize_keyboard: true,
-        persistent: true
+    // ➕ 手动开卡（第一步：选择天数）
+    if (text === "➕ 手动开卡") {
+      const replyMarkup = {
+        inline_keyboard: [
+          [{ text: "7 天", callback_data: "newuser_days_7" }, { text: "30 天", callback_data: "newuser_days_30" }],
+          [{ text: "90 天", callback_data: "newuser_days_90" }, { text: "365 天", callback_data: "newuser_days_365" }]
+        ]
       };
-      await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "👥 【用户管理】\n请选择操作：", userMenu);
+      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: "➕ 【手动开卡】\n请选择开通时长：",
+          reply_markup: replyMarkup
+        })
+      });
       return new Response("OK");
     }
 
-    // 删除用户（第一步：显示用户选择器）
-    if (text === "🗑️ 删除用户") {
-      await showUserPicker(env, chatId, "del", "🗑️ 【删除用户】\n请选择要删除的用户：\n\n（删除后 24 小时内可恢复）");
-      return new Response("OK");
-    }
-
-    // 删除用户流程：输入 UID → 确认
-    if (actionState && actionState.mode === "del_uid" && /^\d+$/.test(text)) {
-      const targetUid = text.trim();
-      const userDataStr = await env.SUB_STORE.get(`user_${targetUid}`);
-      await env.SUB_STORE.delete("admin_action_state");
-      if (!userDataStr) {
-        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `❌ 用户 UID:${targetUid} 不存在`, MAIN_MENU);
-      } else {
-        const u = JSON.parse(userDataStr);
-        // 保存删除前的数据，供撤销恢复
-        const delId = Date.now();
-        await env.SUB_STORE.put(`revoke_del_${delId}`, JSON.stringify({
-          uid: targetUid,
-          data: JSON.parse(userDataStr),
-          time: Date.now()
-        }), { expirationTtl: 86400 });
-        await env.SUB_STORE.delete(`user_${targetUid}`);
-        await clearUserCache(env, targetUid);
-        await unindexUserChatId(env, u.chatId);
-        await logAction(env, "删除用户", `UID:${targetUid} ChatID:${u.chatId || "-"}`);
-        const replyMarkup = { inline_keyboard: [[{ text: "↩️ 恢复用户", callback_data: `undel_${targetUid}` }]] };
-        await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: `🗑️ 用户 [${targetUid}] 已删除！\n\n如需恢复请点击下方按钮：`,
-            reply_markup: replyMarkup
-          })
-        });
-      }
-      return new Response("OK");
-    }
-
-    // 分配上游（第一步：显示用户选择器）
+// 分配上游（第一步：显示用户选择器）
     if (text === "🎯 分配上游") {
       await showUserPicker(env, chatId, "assign", "🎯 【分配上游】\n请选择要分配的用户：");
       return new Response("OK");
@@ -2770,26 +2732,6 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // 手动开卡（第一步：选择天数）
-    if (text === "➕ 手动开卡") {
-      const replyMarkup = {
-        inline_keyboard: [
-          [{ text: "7 天", callback_data: "newuser_days_7" }, { text: "30 天", callback_data: "newuser_days_30" }],
-          [{ text: "90 天", callback_data: "newuser_days_90" }, { text: "365 天", callback_data: "newuser_days_365" }]
-        ]
-      };
-      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: "➕ 【手动开卡】\n请选择开通时长：",
-          reply_markup: replyMarkup
-        })
-      });
-      return new Response("OK");
-    }
-
     // 订单管理
     if (text === "📦 订单管理") {
       const orderMenu = {
@@ -2875,14 +2817,15 @@ async function handleAdminBot(request, env) {
       const settingsMenu = {
         keyboard: [
           [{ text: "🔗 上游池管理" }, { text: "🖼️ 设置收款码" }],
-          [{ text: "💰 设置价格" }, { text: "📅 设置时长" }],
-          [{ text: "📢 发布公告" }, { text: "📞 设置客服" }],
+          [{ text: "📢 发布公告" }],
           [{ text: "🏠 返回主菜单" }]
         ],
         resize_keyboard: true,
         persistent: true
       };
-      await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "⚙️ 【系统设置】\n请选择要配置的项目：", settingsMenu);
+      await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
+        "⚙️ 【系统设置】\n\n🔗 上游池管理 / 🖼️ 设置收款码 / 📢 发布公告\n价格、时长、客服设置请用左侧命令菜单：\n/price /days /service",
+        settingsMenu);
       return new Response("OK");
     }
 
@@ -3298,7 +3241,6 @@ async function handleAdminBot(request, env) {
     if (text === "🎫 卡密管理") {
       const cardMenu = {
         keyboard: [
-          [{ text: "➕ 生成卡密" }, { text: "🎁 生成优惠券" }],
           [{ text: "📋 卡密统计" }, { text: "🔍 查询卡密" }],
           [{ text: "🗑️ 清理已用卡密" }],
           [{ text: "🏠 返回主菜单" }]
@@ -3307,7 +3249,7 @@ async function handleAdminBot(request, env) {
         persistent: true
       };
       await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
-        `🎫 【卡密管理】\n\n点击【➕ 生成卡密】即可通过按钮快速生成，\n或直接使用命令：\n\`/gencard 数量 天数 价格\`\n例：\`/gencard 10 30 30元\`\n\n🎁 优惠券命令：\n\`/gencp 数量 天数 折扣 备注\`\n例：\`/gencp 5 30 80 八折月卡\``,
+        `🎫 【卡密管理】\n\n📋 卡密统计 / 查询 / 清理\n批量生成请用左侧命令菜单：\n\`/gencard 数量 天数 价格\`\n\`/gencp 数量 天数 折扣 备注\``,
         cardMenu);
       return new Response("OK");
     }
@@ -3711,7 +3653,7 @@ async function handleAdminBot(request, env) {
                       `**📦 订单管理**\n- 待审核：查看付款凭证\n- 已处理：处理记录\n- 收款流水：订单流水与金额统计\n- 发货：凭证下方点【确认到账】\n\n` +
                       `**⚙️ 系统设置**\n- 上游池：/addurl 链接 添加（可无限加）\n- 管理上游：/listurl /delurl /setdef\n- 合并节点：/merge on 合并所有上游节点\n- 节点管理：/nodes 查看 /nodeoff 禁用 /nodeon 启用\n- 收款码：点菜单后发图，自动转换\n- 价格：/price 内容\n- 天数：/days 数字\n- 公告：📢 发布公告\n\n` +
                       `**📣 群发通知**\n- 给所有用户发消息\n\n` +
-                      `**💰 分销系统**\n- 创建分销商（自动生成推广链接）\n- 设置佣金比例\n- 查看推广点击与佣金\n\n` +
+                      `**💰 分销系统**\n- 创建分销商（自动生成推广链接）\n- 设置佣金比例\n- 查看推广点击与佣金\n- 删除分销商\n\n` +
                       `**📊 系统概览**\n- 用户/订单/卡密/流水全统计\n\n` +
                       `**⏰ 到期提醒（自动）**\n- 到期前 ${REMINDER_DAYS.join("/")} 天自动通知`;
       await sendTGMenu(ADMIN_BOT_TOKEN, chatId, helpMsg, MAIN_MENU);
