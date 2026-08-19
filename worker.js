@@ -793,14 +793,24 @@ async function handleStoreBot(request, env) {
         });
         const photoJson = await photoRes.json().catch(() => ({}));
         if (!photoJson.ok) {
-          // 收款码发送失败（如 file_id 失效）：清理已建订单 + 删除套餐选择消息，提示买家重试
+          // 收款码发送失败（如 file_id 失效）：
+          // 1. 清理已建订单 + 删除套餐选择消息
+          // 2. 自动从列表移除失效的收款码（自愈，避免买家反复卡死）
+          // 3. 通知管理员重新上传
           try { await env.SUB_STORE.delete(`pending_${orderId}`); } catch (e) {}
           try { await deleteTGMessage(STORE_BOT_TOKEN, cbChatId, cb.message.message_id); } catch (e) {}
+          try {
+            const qrList = await getPaymentQRs(env);
+            const newList = qrList.filter(q => q.fileId !== qrFileId);
+            if (newList.length !== qrList.length) {
+              await savePaymentQRs(env, newList);
+            }
+          } catch (e) {}
           await sendTGMenu(STORE_BOT_TOKEN, cbChatId,
-            "⚠️ 收款码发送失败，请稍后重试或联系客服。", storeMenu);
+            "⚠️ 收款码暂时不可用，请稍后重试或联系客服。", storeMenu);
           try {
             await sendTGText(ADMIN_BOT_TOKEN, ADMIN_ID,
-              `⚠️ 【收款码发送失败】\n买家 ChatID: ${cbChatId}\n套餐: ${plan.name}\n\n请检查收款码是否有效：/qrlist 查看，/setqr 重新上传。`);
+              `⚠️ 【收款码发送失败】\n买家 ChatID: ${cbChatId}\n套餐: ${plan.name}\n\n该收款码可能已失效，已自动移除。\n请用 /qrlist 查看剩余收款码，或 /setqr 重新上传。`);
           } catch (e) {}
           return new Response("OK");
         }
@@ -3685,7 +3695,14 @@ async function rateLimit(env, scope, chatId, seconds = 5) {
   const last = await env.SUB_STORE.get(key);
   const now = Date.now();
   if (last && (now - parseInt(last)) < seconds * 1000) return false;
-  await env.SUB_STORE.put(key, now.toString(), { expirationTtl: seconds });
+  try {
+    // ⚠️ Cloudflare KV 的 expirationTtl 最小是 60 秒！小于 60 会抛错
+    // 这里用 put 前先 get 判断的方式 + 存时间戳 + 最小 TTL 60
+    await env.SUB_STORE.put(key, now.toString(), { expirationTtl: Math.max(seconds, 60) });
+  } catch (e) {
+    // 频控写失败不应阻断业务（降级为不频控）
+    try { await env.SUB_STORE.put(key, now.toString()); } catch (e2) {}
+  }
   return true;
 }
 
