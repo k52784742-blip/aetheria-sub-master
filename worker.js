@@ -207,9 +207,57 @@ async function handleWebhookSetup(request, env) {
     const adminRes = await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(adminWebhook)}${secretParam}`);
     const adminJson = await adminRes.json();
 
+    // ===== 注册左侧命令菜单（点"/"即可看到，一键触发，无需手输命令）=====
+    // 前台售卖 Bot 命令菜单（买家可见）
+    const storeCommands = [
+      { command: "start", description: "🏠 开始 / 公告" },
+      { command: "buy", description: "🛒 购买套餐" },
+      { command: "query", description: "🔍 查询订阅" },
+      { command: "card", description: "🎫 兑换卡密" },
+      { command: "coupon", description: "🎁 优惠券兑换" },
+      { command: "faq", description: "❓ 常见问题" },
+      { command: "service", description: "📞 联系客服" }
+    ];
+    // 管理 Bot 命令菜单（仅管理员可见）
+    const adminCommands = [
+      { command: "start", description: "🏠 主菜单" },
+      { command: "check", description: "📊 查用户 /check UID" },
+      { command: "gencard", description: "🎫 生成卡密 /gencard 数量 天数 价格" },
+      { command: "gencp", description: "🎁 生成优惠券 /gencp 数量 天数 折扣 备注" },
+      { command: "addurl", description: "🔗 添加上游 /addurl 链接" },
+      { command: "delurl", description: "🗑️ 删除上游 /delurl 序号" },
+      { command: "setdef", description: "⭐ 设默认上游 /setdef 序号" },
+      { command: "nodes", description: "📡 查看节点 /nodes [序号]" },
+      { command: "nodeoff", description: "🔴 禁用节点 /nodeoff 1,3,5|all" },
+      { command: "nodeon", description: "🟢 启用节点 /nodeon 1,3,5|all" },
+      { command: "nodelist", description: "📋 节点禁用列表" },
+      { command: "merge", description: "🔄 合并模式 /merge on|off" },
+      { command: "price", description: "💰 设置价格 /price 内容" },
+      { command: "days", description: "📅 设置时长 /days 数字" },
+      { command: "service", description: "📞 设置客服 /service @用户名" },
+      { command: "setup", description: "🔗 设上游 /setup 链接" },
+      { command: "qrlist", description: "🖼️ 收款码列表" },
+      { command: "qrdel", description: "🗑️ 删收款码 /qrdel 序号" },
+      { command: "cancel", description: "❌ 取消当前操作" }
+    ];
+
+    const setStoreCmds = await fetch(`https://api.telegram.org/bot${STORE_BOT_TOKEN}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commands: storeCommands })
+    }).then(r => r.json()).catch(() => ({}));
+
+    const setAdminCmds = await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commands: adminCommands })
+    }).then(r => r.json()).catch(() => ({}));
+
     return new Response(JSON.stringify({
       store_bot: storeJson,
       admin_bot: adminJson,
+      store_commands: setStoreCmds,
+      admin_commands: setAdminCmds,
       store_webhook: storeWebhook,
       admin_webhook: adminWebhook,
       secret_enabled: !!secret
@@ -789,7 +837,21 @@ async function handleStoreBot(request, env) {
     if (msg.chat && msg.chat.type && msg.chat.type !== "private") return new Response("OK");
 
     const chatId = msg.chat.id;
-    const text = msg.text || "";
+    let text = msg.text || "";
+
+    // ===== 左侧命令菜单按钮映射（/query /card /coupon /faq /service 等）=====
+    // 命令菜单点一下自动发送这些文本，这里转为对应的菜单按钮行为
+    const cmdMap = {
+      "/query": "🔍 查询订阅",
+      "/card": "🎫 兑换卡密",
+      "/coupon": "🎁 优惠券",
+      "/faq": "❓ 常见问题",
+      "/service": "📞 联系客服",
+      "/buy": "🛒 购买套餐"
+    };
+    if (cmdMap[text]) {
+      text = cmdMap[text];
+    }
 
     // 处理前台菜单
     if (text === "🛒 购买套餐" || text === "/start" || text === "/buy" || text.includes("购买")) {
