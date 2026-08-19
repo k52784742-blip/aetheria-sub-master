@@ -700,10 +700,10 @@ async function handleStoreBot(request, env) {
 
         // 防抖：检查该买家是否有未完成的待审订单（5分钟内），避免重复下单
         try {
-          const pendingOrders = await env.SUB_STORE.list({ prefix: "pending_", limit: 50 });
+          const pendingKeys = await listAllKeys(env, "pending_", 2000);
           const now = Date.now();
-          for (const k of pendingOrders.keys) {
-            const o = JSON.parse(await env.SUB_STORE.get(k.name));
+          for (const k of pendingKeys) {
+            const o = JSON.parse(await env.SUB_STORE.get(k));
             if (o.chatId === cbChatId && (now - (o.time || 0)) < 5 * 60 * 1000) {
               await answerCallback(STORE_BOT_TOKEN, cb.id, "⏳ 您有一笔订单处理中，请先完成支付或等待处理");
               return new Response("OK");
@@ -731,22 +731,31 @@ async function handleStoreBot(request, env) {
 
         // 生成唯一订单号
         const orderId = genOrderId();
-        const photoParam = qrFileId.startsWith("http") ? qrFileId : qrFileId;
 
-        // 收款码总数（多张时提示轮换）
-        const qrCount = (await getPaymentQRs(env)).length;
-
-        // 发送收款码
-        await fetch(`https://api.telegram.org/bot${STORE_BOT_TOKEN}/sendPhoto`, {
+        // 发送收款码（检查结果：失败则清理订单，避免买家卡死）
+        const photoRes = await fetch(`https://api.telegram.org/bot${STORE_BOT_TOKEN}/sendPhoto`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             chat_id: cbChatId,
-            photo: photoParam,
+            photo: qrFileId,
             caption: `💎 【自助下单结算】\n\n• 订单编号: \`${orderId}\`\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}\n\n📌 请扫描上方二维码完成支付\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付`,
             parse_mode: "Markdown"
           })
         });
+        const photoJson = await photoRes.json().catch(() => ({}));
+        if (!photoJson.ok) {
+          // 收款码发送失败（如 file_id 失效）：清理已建订单 + 删除套餐选择消息，提示买家重试
+          try { await env.SUB_STORE.delete(`pending_${orderId}`); } catch (e) {}
+          try { await deleteTGMessage(STORE_BOT_TOKEN, cbChatId, cb.message.message_id); } catch (e) {}
+          await sendTGMenu(STORE_BOT_TOKEN, cbChatId,
+            "⚠️ 收款码发送失败，请稍后重试或联系客服。", storeMenu);
+          try {
+            await sendTGText(ADMIN_BOT_TOKEN, ADMIN_ID,
+              `⚠️ 【收款码发送失败】\n买家 ChatID: ${cbChatId}\n套餐: ${plan.name}\n\n请检查收款码是否有效：/qrlist 查看，/setqr 重新上传。`);
+          } catch (e) {}
+          return new Response("OK");
+        }
 
         // 存储待审订单（含套餐信息）
         await env.SUB_STORE.put(`pending_${orderId}`, JSON.stringify({
@@ -775,6 +784,9 @@ async function handleStoreBot(request, env) {
 
     const msg = update.message;
     if (!msg) return new Response("OK");
+
+    // 仅处理私聊，群组/频道内 @bot 消息忽略（避免 chatId 错用群 ID 导致系统错乱）
+    if (msg.chat && msg.chat.type && msg.chat.type !== "private") return new Response("OK");
 
     const chatId = msg.chat.id;
     const text = msg.text || "";
@@ -989,9 +1001,10 @@ async function handleStoreBot(request, env) {
       return new Response("OK");
     }
 
-    // 处理付款凭证：仅当买家发送【图片/照片】时才进入审核流程
+    // 处理付款凭证：买家发送【图片/视频/文件】时进入审核流程
     // 普通文字消息（咨询/闲聊）不应触发付款审核
-    if (!msg.photo) {
+    const hasMedia = !!(msg.photo || msg.video || msg.document);
+    if (!hasMedia) {
       // 检查是否处于卡密兑换状态（可能是文字卡密）
       const redeeming = await env.SUB_STORE.get(`redeem_state_${chatId}`);
       if (redeeming || /^MB-/.test(text.toUpperCase())) {
@@ -1017,7 +1030,13 @@ async function handleStoreBot(request, env) {
       return new Response("OK");
     }
 
-    // ===== 以下仅处理带图片的消息（付款凭证审核流程）=====
+    // ===== 以下仅处理带媒体的消息（付款凭证审核流程）=====
+    // 防重复提交：30 秒内同一买家只能提交一次凭证，避免刷屏管理员
+    if (!(await rateLimit(env, "proof", chatId, 30))) {
+      await sendTGMenu(STORE_BOT_TOKEN, chatId, "⏳ 凭证已提交，请耐心等待审核（30秒内请勿重复发送）", storeMenu);
+      return new Response("OK");
+    }
+
     const buyerName = msg.from.first_name || "用户";
     const buyerUsername = msg.from.username ? `@${msg.from.username}` : "无";
 
@@ -1518,19 +1537,57 @@ async function handleAdminBot(request, env) {
         const pageUsers = allUsers.slice(start, start + 5);
 
         let listText = `👥 【用户列表】 (第 ${page}/${totalPages} 页)\n\n`;
+        const rows = [];
         for (const uid of pageUsers) {
           const u = JSON.parse(await env.SUB_STORE.get(`user_${uid}`));
           const remainDays = Math.ceil((u.expiry - Date.now()) / 86400000);
           const state = u.status === "disabled" ? "🔴" : (remainDays <= 0 ? "⏳" : "🟢");
           listText += `${state} UID:${uid} | 剩 ${Math.max(0, remainDays)} 天${u.note ? ` | 📝${u.note.slice(0, 10)}` : ""}\n`;
+          // 每个用户一行操作按钮：详情 / 禁用(或启用) / 删除
+          rows.push([
+            { text: `📋 ${uid}`, callback_data: `check_${uid}` },
+            { text: u.status === "disabled" ? "🟢 启用" : "🔴 禁用", callback_data: `${u.status === "disabled" ? "enable" : "disable"}_${uid}` },
+            { text: "🗑️ 删除", callback_data: `del_${uid}` }
+          ]);
         }
 
         const navBtns = [];
         if (page > 1) navBtns.push({ text: "◀️ 上一页", callback_data: `ulist_${page - 1}` });
         if (page < totalPages) navBtns.push({ text: "下一页 ▶️", callback_data: `ulist_${page + 1}` });
+        if (navBtns.length) rows.push(navBtns);
 
         replyText = listText;
-        replyMarkup = { inline_keyboard: navBtns.length ? [navBtns] : [] };
+        replyMarkup = { inline_keyboard: rows };
+      }
+
+      // 用户详情（从列表进入）
+      else if (data.startsWith("check_")) {
+        const checkUid = data.replace("check_", "");
+        const checkStr = await env.SUB_STORE.get(`user_${checkUid}`);
+        if (!checkStr) {
+          replyAlert = `❌ 用户 UID:${checkUid} 不存在`;
+        } else {
+          const cu = JSON.parse(checkStr);
+          const remainDays = Math.ceil((cu.expiry - Date.now()) / 86400000);
+          const stateDesc = cu.status === "disabled" ? "🔴 禁用中" : (remainDays <= 0 ? "⏳ 已过期" : "🟢 正常运行");
+          const origin = new URL(request.url).origin;
+          const upStatus = cu.upstreamUrl ? `🎯 已指定:\n${cu.upstreamUrl.slice(0, 50)}` : "🔄 自动分配";
+          replyText = `📊 【用户档案: ${checkUid}】\n• 状态: ${stateDesc}\n• 剩余: ${Math.max(0, remainDays)} 天\n• 到期: ${new Date(cu.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n• ChatID: ${cu.chatId || "-"}\n${cu.note ? `• 备注: ${cu.note}\n` : ""}• 上游: ${upStatus}\n• 短链: ${origin}/s/${checkUid}`;
+          replyMarkup = {
+            inline_keyboard: [
+              [
+                { text: "🔴 禁用", callback_data: `disable_${checkUid}` },
+                { text: "🟢 开启", callback_data: `enable_${checkUid}` },
+                { text: "🗑️ 删除", callback_data: `del_${checkUid}` }
+              ],
+              [
+                { text: "🎯 分配上游", callback_data: `assign_${checkUid}` },
+                { text: "↩️ 撤销删除", callback_data: `undel_${checkUid}` }
+              ],
+              [{ text: "◀️ 返回列表", callback_data: "ulist_1" }]
+            ]
+          };
+        }
       }
 
       // 待审核订单（游标分页取全量）
@@ -2287,15 +2344,23 @@ async function handleAdminBot(request, env) {
       }
 
       let listText = `👥 【用户列表】 (第 1/${totalPages} 页)\n\n`;
+      const rows = [];
       for (const uid of allUsers.slice(0, 5)) {
         const u = JSON.parse(await env.SUB_STORE.get(`user_${uid}`));
         const remainDays = Math.ceil((u.expiry - Date.now()) / 86400000);
         const state = u.status === "disabled" ? "🔴" : (remainDays <= 0 ? "⏳" : "🟢");
         listText += `${state} UID:${uid} | 剩 ${Math.max(0, remainDays)} 天${u.note ? ` | 📝${u.note.slice(0, 10)}` : ""}\n`;
+        // 每个用户一行操作按钮：详情 / 禁用(或启用) / 删除
+        rows.push([
+          { text: `📋 ${uid}`, callback_data: `check_${uid}` },
+          { text: u.status === "disabled" ? "🟢 启用" : "🔴 禁用", callback_data: `${u.status === "disabled" ? "enable" : "disable"}_${uid}` },
+          { text: "🗑️ 删除", callback_data: `del_${uid}` }
+        ]);
       }
 
       const navBtns = [];
       if (totalPages > 1) navBtns.push({ text: "下一页 ▶️", callback_data: "ulist_2" });
+      if (navBtns.length) rows.push(navBtns);
 
       await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
         method: "POST",
@@ -2303,7 +2368,7 @@ async function handleAdminBot(request, env) {
         body: JSON.stringify({
           chat_id: chatId,
           text: listText,
-          reply_markup: navBtns.length ? { inline_keyboard: [navBtns] } : {}
+          reply_markup: rows.length ? { inline_keyboard: rows } : {}
         })
       });
       return new Response("OK");
