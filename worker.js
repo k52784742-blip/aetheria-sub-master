@@ -221,6 +221,7 @@ async function handleWebhookSetup(request, env) {
     // 管理 Bot 命令菜单（仅管理员可见）
     const adminCommands = [
       { command: "start", description: "🏠 主菜单" },
+      { command: "sc", description: "⚡ 快捷管理用户 /sc [UID]" },
       { command: "check", description: "📊 查用户 /check UID" },
       { command: "gencard", description: "🎫 生成卡密 /gencard 数量 天数 价格" },
       { command: "gencp", description: "🎁 生成优惠券 /gencp 数量 天数 折扣 备注" },
@@ -1823,6 +1824,73 @@ async function handleAdminBot(request, env) {
         }
       }
 
+      // 用户操作面板：ops_{uid}（/sc 和 /users 进入）
+      else if (data.startsWith("ops_")) {
+        const opsUid = data.replace("ops_", "");
+        const opsStr = await env.SUB_STORE.get(`user_${opsUid}`);
+        if (!opsStr) {
+          replyAlert = `❌ 用户 UID:${opsUid} 不存在`;
+        } else {
+          const ou = JSON.parse(opsStr);
+          const remainDays = Math.ceil((ou.expiry - Date.now()) / 86400000);
+          const stateDesc = ou.status === "disabled" ? "🔴 禁用中" : (remainDays <= 0 ? "⏳ 已过期" : "🟢 正常运行");
+          const origin = new URL(request.url).origin;
+          const upStatus = ou.upstreamUrl ? "🎯 已指定" : "🔄 自动分配";
+          replyText = `📊 【用户: ${opsUid}】\n• 状态: ${stateDesc}\n• 剩余: ${Math.max(0, remainDays)} 天\n• 到期: ${new Date(ou.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n• ChatID: ${ou.chatId || "-"}\n${ou.note ? `• 备注: ${ou.note}\n` : ""}• 上游: ${upStatus}\n\n请选择操作：`;
+          replyMarkup = {
+            inline_keyboard: [
+              [
+                { text: "🔴 禁用", callback_data: `disable_${opsUid}` },
+                { text: "🟢 开启", callback_data: `enable_${opsUid}` },
+                { text: "🗑️ 删除", callback_data: `del_${opsUid}` }
+              ],
+              [
+                { text: "⏱️ 调整时长", callback_data: `pick_adjust_${opsUid}` },
+                { text: "🎯 分配上游", callback_data: `assign_${opsUid}` }
+              ],
+              [
+                { text: "📝 备注", callback_data: `pick_note_${opsUid}` },
+                { text: "💬 私信", callback_data: `pick_msg_${opsUid}` }
+              ],
+              [
+                { text: "↩️ 撤销删除", callback_data: `undel_${opsUid}` },
+                { text: "🔗 订阅链接", callback_data: `link_${opsUid}` }
+              ],
+              [{ text: "◀️ 返回", callback_data: "sc_list" }]
+            ]
+          };
+        }
+      }
+
+      // 订阅链接展示：link_{uid}
+      else if (data.startsWith("link_")) {
+        const linkUid = data.replace("link_", "");
+        const origin = new URL(request.url).origin;
+        replyText = `🔗 【订阅链接】\nUID: ${linkUid}\n\n• 普通订阅: ${origin}/s/${linkUid}\n• 兼容订阅: ${origin}/s/${linkUid}?legacy=1\n• YAML订阅: ${origin}/s/${linkUid}?yaml=1`;
+      }
+
+      // 用户快捷列表：sc_list（/sc 无参数时）
+      else if (data === "sc_list") {
+        const scKeys = await listAllKeys(env, "user_", 5000);
+        if (scKeys.length === 0) {
+          replyAlert = "📭 当前没有任何用户";
+        } else {
+          const rows = [];
+          let row = [];
+          for (const k of scKeys) {
+            const uid = k.replace("user_", "");
+            row.push({ text: uid, callback_data: `ops_${uid}` });
+            if (row.length === 3) {
+              rows.push(row);
+              row = [];
+            }
+          }
+          if (row.length) rows.push(row);
+          replyText = `👥 【用户列表】\n点击 UID 进入操作面板：\n\n（共 ${scKeys.length} 位用户）`;
+          replyMarkup = { inline_keyboard: rows };
+        }
+      }
+
       // 用户选择器回调：pick_{mode}_{uid}
       // mode: adjust(调整时长) / assign(分配上游) / note(备注) / msg(私信) / del(删除)
       else if (data.startsWith("pick_")) {
@@ -1878,6 +1946,34 @@ async function handleAdminBot(request, env) {
             await logAction(env, "删除用户", `UID:${pickUid} ChatID:${du.chatId || "-"}`);
             replyText = `🗑️ 用户 [${pickUid}] 已删除！\n\n如需恢复请点击下方按钮：`;
             replyMarkup = { inline_keyboard: [[{ text: "↩️ 恢复用户", callback_data: `undel_${pickUid}` }]] };
+          } else if (mode === "ops") {
+            // 用户操作面板（/sc 无参数时选择进入）
+            const ou = JSON.parse(pickUserStr);
+            const remainDays = Math.ceil((ou.expiry - Date.now()) / 86400000);
+            const stateDesc = ou.status === "disabled" ? "🔴 禁用中" : (remainDays <= 0 ? "⏳ 已过期" : "🟢 正常运行");
+            const origin = new URL(request.url).origin;
+            replyText = `📊 【用户: ${pickUid}】\n• 状态: ${stateDesc}\n• 剩余: ${Math.max(0, remainDays)} 天\n• 到期: ${new Date(ou.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n• ChatID: ${ou.chatId || "-"}\n${ou.note ? `• 备注: ${ou.note}\n` : ""}\n\n请选择操作：`;
+            replyMarkup = {
+              inline_keyboard: [
+                [
+                  { text: "🔴 禁用", callback_data: `disable_${pickUid}` },
+                  { text: "🟢 开启", callback_data: `enable_${pickUid}` },
+                  { text: "🗑️ 删除", callback_data: `del_${pickUid}` }
+                ],
+                [
+                  { text: "⏱️ 调整时长", callback_data: `pick_adjust_${pickUid}` },
+                  { text: "🎯 分配上游", callback_data: `assign_${pickUid}` }
+                ],
+                [
+                  { text: "📝 备注", callback_data: `pick_note_${pickUid}` },
+                  { text: "💬 私信", callback_data: `pick_msg_${pickUid}` }
+                ],
+                [
+                  { text: "↩️ 撤销删除", callback_data: `undel_${pickUid}` },
+                  { text: "🔗 订阅链接", callback_data: `link_${pickUid}` }
+                ]
+              ]
+            };
           } else {
             replyAlert = "❌ 未知操作";
           }
@@ -3737,6 +3833,67 @@ async function handleAdminBot(request, env) {
       } else {
         await env.SUB_STORE.put("default_days", days.toString());
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `✅ 【默认时长已设置】\n${days} 天`, MAIN_MENU);
+      }
+      return new Response("OK");
+    }
+
+    // ===== /sc 快捷用户命令 =====
+    // /sc 无参数 → 列出所有用户供选择；/sc UID → 直接进操作面板
+    if (text === "/sc" || text.startsWith("/sc ")) {
+      const scArg = text === "/sc" ? "" : text.replace("/sc ", "").trim();
+      if (scArg) {
+        // 指定 UID 或 ChatID
+        let scUid = scArg;
+        let scDataStr = await env.SUB_STORE.get(`user_${scUid}`);
+        if (!scDataStr && /^\d+$/.test(scArg)) {
+          const uidByChat = await findUidByChatId(env, parseInt(scArg));
+          if (uidByChat) {
+            scUid = uidByChat;
+            scDataStr = await env.SUB_STORE.get(`user_${uidByChat}`);
+          }
+        }
+        if (!scDataStr) {
+          await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `❌ 未找到用户 UID/ChatID: ${scArg}`, MAIN_MENU);
+        } else {
+          const su = JSON.parse(scDataStr);
+          const remainDays = Math.ceil((su.expiry - Date.now()) / 86400000);
+          const stateDesc = su.status === "disabled" ? "🔴 禁用中" : (remainDays <= 0 ? "⏳ 已过期" : "🟢 正常运行");
+          const origin = new URL(request.url).origin;
+          const upStatus = su.upstreamUrl ? "🎯 已指定" : "🔄 自动分配";
+          const replyMarkup = {
+            inline_keyboard: [
+              [
+                { text: "🔴 禁用", callback_data: `disable_${scUid}` },
+                { text: "🟢 开启", callback_data: `enable_${scUid}` },
+                { text: "🗑️ 删除", callback_data: `del_${scUid}` }
+              ],
+              [
+                { text: "⏱️ 调整时长", callback_data: `pick_adjust_${scUid}` },
+                { text: "🎯 分配上游", callback_data: `assign_${scUid}` }
+              ],
+              [
+                { text: "📝 备注", callback_data: `pick_note_${scUid}` },
+                { text: "💬 私信", callback_data: `pick_msg_${scUid}` }
+              ],
+              [
+                { text: "↩️ 撤销删除", callback_data: `undel_${scUid}` },
+                { text: "🔗 订阅链接", callback_data: `link_${scUid}` }
+              ]
+            ]
+          };
+          await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: `📊 【用户: ${scUid}】\n• 状态: ${stateDesc}\n• 剩余: ${Math.max(0, remainDays)} 天\n• 到期: ${new Date(su.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n• ChatID: ${su.chatId || "-"}\n${su.note ? `• 备注: ${su.note}\n` : ""}• 上游: ${upStatus}\n\n请选择操作：`,
+              reply_markup: replyMarkup
+            })
+          });
+        }
+      } else {
+        // 无参数：显示所有用户选择器
+        await showUserPicker(env, chatId, "ops", "👥 【用户列表】\n点击 UID 进入操作面板：\n\n（/sc UID 也可直接指定）");
       }
       return new Response("OK");
     }
