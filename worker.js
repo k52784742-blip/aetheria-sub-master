@@ -1996,10 +1996,18 @@ async function handleAdminBot(request, env) {
 
       // 手动开卡：第一步（确认天数）
       else if (data.startsWith("newuser_days_")) {
-        const days = parseInt(data.replace("newuser_days_", ""));
-        replyText = `➕ 【手动开卡】\n请发送需要开通的聊天 ID（买家 ChatID）：\n\n（将开通 ${days} 天）\n\n> 格式：直接发送数字即可`;
-        await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "newuser", days, chatId }));
-        replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+        const val = data.replace("newuser_days_", "");
+        if (val === "custom") {
+          // 自定义天数：进入输入天数状态
+          replyText = `➕ 【手动开卡】\n请发送开通天数（如 45）：\n\n> 也可直接指定到期日期，格式：\n> \`到期 2026-12-31\``;
+          await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "newuser_days_custom", chatId }));
+          replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+        } else {
+          const days = parseInt(val);
+          replyText = `➕ 【手动开卡】\n请发送需要开通的聊天 ID（买家 ChatID）：\n\n（将开通 ${days} 天）\n\n> 格式：直接发送数字即可`;
+          await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "newuser", days, chatId }));
+          replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+        }
       }
 
       // 设置默认时长：快捷按钮
@@ -2213,6 +2221,65 @@ async function handleAdminBot(request, env) {
       try { actionState = JSON.parse(actionStateStr); } catch (e) {}
     }
 
+    // 手动开卡：自定义天数输入（支持纯天数或 "到期 YYYY-MM-DD"）
+    if (actionState && actionState.mode === "newuser_days_custom") {
+      const input = text.trim();
+      let days = null;
+      let tip = "";
+
+      // 格式1：纯数字天数（如 45）
+      if (/^\d+$/.test(input)) {
+        days = parseInt(input);
+        tip = `（自定义 ${days} 天）`;
+      }
+      // 格式2：到期日期（如 "到期 2026-12-31"）
+      else if (/^到期\s*(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/.test(input)) {
+        const m = input.match(/^到期\s*(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
+        const y = parseInt(m[1]), mo = parseInt(m[2]), d = parseInt(m[3]);
+        // 校验月份/日期合法性（防止 JS Date 自动进位如 13月45日 → 次年）
+        if (mo < 1 || mo > 12 || d < 1 || d > 31) {
+          await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 日期格式无效，示例：到期 2026-12-31", MAIN_MENU);
+          return new Response("OK");
+        }
+        const expireDate = new Date(y, mo - 1, d);
+        if (isNaN(expireDate.getTime()) || expireDate.getDate() !== d || expireDate.getMonth() !== mo - 1) {
+          await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 日期格式无效，示例：到期 2026-12-31", MAIN_MENU);
+          return new Response("OK");
+        }
+        // 到期日当天 23:59:59 为截止
+        expireDate.setHours(23, 59, 59, 999);
+        days = Math.max(1, Math.ceil((expireDate.getTime() - Date.now()) / 86400000));
+        tip = `（自定义到期 ${m[1]}-${m[2]}-${m[3]}，共 ${days} 天）`;
+      } else {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
+          "❌ 输入无效\n\n请发送天数（如 45）\n或指定到期日期（如：到期 2026-12-31）", MAIN_MENU);
+        return new Response("OK");
+      }
+
+      if (days <= 0) {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 天数必须大于 0", MAIN_MENU);
+        return new Response("OK");
+      }
+      if (days > 3650) {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 天数过大（最多 3650 天）", MAIN_MENU);
+        return new Response("OK");
+      }
+
+      // 进入输入 ChatID 状态
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "newuser", days, chatId }));
+      const replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: `➕ 【手动开卡】\n请发送需要开通的聊天 ID（买家 ChatID）：\n\n${tip}\n\n> 格式：直接发送数字即可`,
+          reply_markup: replyMarkup
+        })
+      });
+      return new Response("OK");
+    }
+
     // 手动开卡流程：等待输入 ChatID
     if (actionState && actionState.mode === "newuser" && /^\d+$/.test(text)) {
       const targetChatId = parseInt(text);
@@ -2268,12 +2335,14 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // ➕ 手动开卡（第一步：选择天数）
+    // ➕ 手动开卡（第一步：选择时长）
     if (text === "➕ 手动开卡") {
       const replyMarkup = {
         inline_keyboard: [
           [{ text: "7 天", callback_data: "newuser_days_7" }, { text: "30 天", callback_data: "newuser_days_30" }],
-          [{ text: "90 天", callback_data: "newuser_days_90" }, { text: "365 天", callback_data: "newuser_days_365" }]
+          [{ text: "90 天", callback_data: "newuser_days_90" }, { text: "365 天", callback_data: "newuser_days_365" }],
+          [{ text: "✏️ 自定义天数", callback_data: "newuser_days_custom" }],
+          [{ text: "❌ 取消", callback_data: "cancel_action" }]
         ]
       };
       await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
