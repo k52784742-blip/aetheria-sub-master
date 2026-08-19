@@ -530,6 +530,7 @@ async function handleBuyerPortal(uid, request, env) {
   const lines = nodeLines;
   const processedNodes = [];
   const seenHosts = new Set();
+  const seenRawLines = new Set();
   const counters = { "香港": 1, "日本": 1, "美国": 1, "新加坡": 1, "其他": 1 };
   // 节点黑名单（循环外读取一次）
   const nodeBlacklist = await getNodeBlacklist(env);
@@ -561,8 +562,16 @@ async function handleBuyerPortal(uid, request, env) {
       const u = new URL(basePart.includes("://") ? basePart : "http://" + basePart);
       hostKey = u.hostname + ":" + u.port;
     } catch (err) {}
-    if (seenHosts.has(hostKey)) continue;
-    seenHosts.add(hostKey);
+
+    // 合并模式：所有上游节点全部下发（仅完全相同行去重）
+    // 非合并模式：按 host 去重（同一上游内避免重复服务器）
+    if (!mergeMode) {
+      if (seenHosts.has(hostKey)) continue;
+      seenHosts.add(hostKey);
+    } else {
+      if (seenRawLines.has(line)) continue;
+      seenRawLines.add(line);
+    }
 
     // 节点黑名单过滤（管理端禁用的节点）
     if (nodeBlacklist.includes(hostKey)) continue;
@@ -1599,7 +1608,7 @@ async function handleAdminBot(request, env) {
           } else {
             const mUser = JSON.parse(userDataStr);
             await env.SUB_STORE.delete(`user_${m.uid}`);
-            await env.SUB_STORE.delete(`cache_${m.uid}`);
+            await clearUserCache(env, m.uid);
             await unindexUserChatId(env, mUser.chatId); // 清理 chatId 索引
             // 通知买家
             try {
@@ -1650,7 +1659,7 @@ async function handleAdminBot(request, env) {
             if (rev.isNew) {
               // 新购撤销：删除该用户
               await env.SUB_STORE.delete(`user_${rev.uid}`);
-              await env.SUB_STORE.delete(`cache_${rev.uid}`);
+              await clearUserCache(env, rev.uid);
               await unindexUserChatId(env, rev.chatId); // 清理 chatId 索引
               // 通知买家
               await sendTGText(STORE_BOT_TOKEN, rev.chatId,
@@ -1742,7 +1751,7 @@ async function handleAdminBot(request, env) {
               time: Date.now()
             }), { expirationTtl: 86400 });
             await env.SUB_STORE.delete(`user_${uid}`);
-            await env.SUB_STORE.delete(`cache_${uid}`);
+            await clearUserCache(env, uid);
             await unindexUserChatId(env, u.chatId); // 清理 chatId 索引
             await logAction(env, "删除用户", `UID:${uid} ChatID:${u.chatId || "-"}`);
             replyText = `🗑️ 用户 [${uid}] 已删除！\n\n如需恢复请点击下方按钮：`;
@@ -1811,6 +1820,67 @@ async function handleAdminBot(request, env) {
               [{ text: "◀️ 返回列表", callback_data: "ulist_1" }]
             ]
           };
+        }
+      }
+
+      // 用户选择器回调：pick_{mode}_{uid}
+      // mode: adjust(调整时长) / assign(分配上游) / note(备注) / msg(私信) / del(删除)
+      else if (data.startsWith("pick_")) {
+        const pickStr = data.replace("pick_", "");
+        const mode = pickStr.split("_")[0];
+        const pickUid = pickStr.slice(mode.length + 1);
+        const pickUserStr = await env.SUB_STORE.get(`user_${pickUid}`);
+        if (!pickUserStr) {
+          replyAlert = `❌ 用户 UID:${pickUid} 不存在`;
+        } else {
+          if (mode === "adjust") {
+            // 调整时长：进入输入天数
+            await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "adjust_days", uid: pickUid, chatId }));
+            replyText = `⏱️ 【调整时长】\nUID:${pickUid}\n\n请输入调整天数：\n• 正数加时长（如 30）\n• 负数减时长（如 -30）\n• 直接设置到期：如 set 30 天`;
+            replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+          } else if (mode === "assign") {
+            // 分配上游：显示上游池选择
+            const pu = JSON.parse(pickUserStr);
+            await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "assign_up", uid: pickUid, chatId }));
+            const pool = await getUpstreamPool(env);
+            const btns = [];
+            pool.forEach((up, i) => {
+              if (up.status !== "active") return;
+              btns.push([{ text: `${up.isDefault ? "⭐" : ""} ${up.note || "上游" + (i + 1)}`, callback_data: `assignup_${i}` }]);
+            });
+            btns.push([{ text: "↩️ 恢复自动分配", callback_data: `assignup_auto` }]);
+            btns.push([{ text: "❌ 取消", callback_data: "cancel_action" }]);
+            const currentUp = pu.upstreamUrl ? "（已指定）" : "（自动分配）";
+            replyText = `🎯 【分配上游】\n用户 UID: ${pickUid} ${currentUp}\n\n请选择要分配的上游：`;
+            replyMarkup = { inline_keyboard: btns };
+          } else if (mode === "note") {
+            // 备注：进入输入备注
+            await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "note_text", uid: pickUid, chatId }));
+            replyText = `📝 【用户备注】\nUID:${pickUid}\n\n请输入备注内容（如：VIP老客户）：`;
+            replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+          } else if (mode === "msg") {
+            // 私信：进入输入消息
+            await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "msg_text", uid: pickUid, chatId }));
+            replyText = `💬 【私信用户】\nUID:${pickUid}\n\n请输入要发送的消息内容：`;
+            replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+          } else if (mode === "del") {
+            // 删除：保存快照后删除 + 可恢复
+            const du = JSON.parse(pickUserStr);
+            const delId = Date.now();
+            await env.SUB_STORE.put(`revoke_del_${delId}`, JSON.stringify({
+              uid: pickUid,
+              data: JSON.parse(pickUserStr),
+              time: Date.now()
+            }), { expirationTtl: 86400 });
+            await env.SUB_STORE.delete(`user_${pickUid}`);
+            await clearUserCache(env, pickUid);
+            await unindexUserChatId(env, du.chatId);
+            await logAction(env, "删除用户", `UID:${pickUid} ChatID:${du.chatId || "-"}`);
+            replyText = `🗑️ 用户 [${pickUid}] 已删除！\n\n如需恢复请点击下方按钮：`;
+            replyMarkup = { inline_keyboard: [[{ text: "↩️ 恢复用户", callback_data: `undel_${pickUid}` }]] };
+          } else {
+            replyAlert = "❌ 未知操作";
+          }
         }
       }
 
@@ -2123,19 +2193,9 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // 删除用户（第一步：输入 UID）
+    // 删除用户（第一步：显示用户选择器）
     if (text === "🗑️ 删除用户") {
-      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "del_uid", chatId }));
-      const replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
-      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: "🗑️ 【删除用户】\n请输入要删除的用户 UID：\n\n（删除后 24 小时内可恢复）",
-          reply_markup: replyMarkup
-        })
-      });
+      await showUserPicker(env, chatId, "del", "🗑️ 【删除用户】\n请选择要删除的用户：\n\n（删除后 24 小时内可恢复）");
       return new Response("OK");
     }
 
@@ -2156,7 +2216,7 @@ async function handleAdminBot(request, env) {
           time: Date.now()
         }), { expirationTtl: 86400 });
         await env.SUB_STORE.delete(`user_${targetUid}`);
-        await env.SUB_STORE.delete(`cache_${targetUid}`);
+        await clearUserCache(env, targetUid);
         await unindexUserChatId(env, u.chatId);
         await logAction(env, "删除用户", `UID:${targetUid} ChatID:${u.chatId || "-"}`);
         const replyMarkup = { inline_keyboard: [[{ text: "↩️ 恢复用户", callback_data: `undel_${targetUid}` }]] };
@@ -2173,19 +2233,9 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // 分配上游（第一步：输入 UID）
+    // 分配上游（第一步：显示用户选择器）
     if (text === "🎯 分配上游") {
-      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "assign_uid", chatId }));
-      const replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
-      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: "🎯 【分配上游】\n请输入用户 UID：\n\n（给指定用户分配专属上游链接）",
-          reply_markup: replyMarkup
-        })
-      });
+      await showUserPicker(env, chatId, "assign", "🎯 【分配上游】\n请选择要分配的用户：");
       return new Response("OK");
     }
 
@@ -2360,19 +2410,9 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // 私信用户（第一步：输入 UID）
+    // 私信用户（第一步：显示用户选择器）
     if (text === "💬 私信用户") {
-      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "msg_uid", chatId }));
-      const replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
-      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: "💬 【私信用户】\n请输入用户 UID：",
-          reply_markup: replyMarkup
-        })
-      });
+      await showUserPicker(env, chatId, "msg", "💬 【私信用户】\n请选择要私信的用户：");
       return new Response("OK");
     }
 
@@ -2424,17 +2464,7 @@ async function handleAdminBot(request, env) {
 
     // 调整时长（第一步：输入 UID）
     if (text === "⏱️ 调整时长") {
-      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "adjust_uid", chatId }));
-      const replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
-      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: "⏱️ 【调整时长】\n请输入用户 UID：",
-          reply_markup: replyMarkup
-        })
-      });
+      await showUserPicker(env, chatId, "adjust", "⏱️ 【调整时长】\n请选择要调整的用户：");
       return new Response("OK");
     }
 
@@ -2550,19 +2580,9 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // 用户备注（第一步：输入 UID）
+    // 用户备注（第一步：显示用户选择器）
     if (text === "📝 用户备注") {
-      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "note_uid", chatId }));
-      const replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
-      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: "📝 【用户备注】\n请输入要备注的 UID：",
-          reply_markup: replyMarkup
-        })
-      });
+      await showUserPicker(env, chatId, "note", "📝 【用户备注】\n请选择要备注的用户：");
       return new Response("OK");
     }
 
@@ -3851,6 +3871,48 @@ async function unindexUserChatId(env, chatId) {
   if (chatId) await env.SUB_STORE.delete(`chatIdx_${chatId}`);
 }
 
+// 清除用户所有订阅缓存变体（普通/legacy/yaml），删除用户时必须全清
+async function clearUserCache(env, uid) {
+  const keys = [`cache_${uid}`, `cache_${uid}_legacy`, `cache_${uid}_yaml`];
+  for (const k of keys) {
+    try { await env.SUB_STORE.delete(k); } catch (e) {}
+  }
+}
+
+// ===== 通用工具：用户选择器 =====
+// 管理端点"调整时长/分配上游/备注/私信/删除"等时，直接列出所有用户供选择
+// mode 用于回调区分：adjust/assign/note/msg/del
+async function showUserPicker(env, chatId, mode, title) {
+  const userKeys = await listAllKeys(env, "user_", 5000);
+  if (userKeys.length === 0) {
+    await sendTGText(ADMIN_BOT_TOKEN, chatId, "📭 当前没有任何用户");
+    return;
+  }
+  // 构建按钮：每行 3 个 UID
+  const rows = [];
+  let row = [];
+  for (const k of userKeys) {
+    const uid = k.replace("user_", "");
+    row.push({ text: uid, callback_data: `pick_${mode}_${uid}` });
+    if (row.length === 3) {
+      rows.push(row);
+      row = [];
+    }
+  }
+  if (row.length) rows.push(row);
+  rows.push([{ text: "❌ 取消", callback_data: "cancel_action" }]);
+
+  await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: title,
+      reply_markup: { inline_keyboard: rows }
+    })
+  });
+}
+
 // ===== 通用工具：分销关联 =====
 // 记录买家 chatId 的推荐分销商（deep link /start=code 时写入）
 async function setBuyerAffiliate(env, chatId, code) {
@@ -4232,11 +4294,11 @@ function generateClashYAML(nodes, brand, uid) {
   return yaml;
 }
 
-// 合并拉取所有活跃上游的节点（去重）
+// 合并拉取所有活跃上游的节点（仅对完全相同的节点去重，保留各上游全部节点）
 async function fetchAllUpstreamsMerged(env) {
   const pool = await getUpstreamPool(env);
   const active = pool.filter(u => u.status === "active");
-  const seenHosts = new Set();
+  const seenLines = new Set();  // 只对完全相同的内容去重
   const mergedNodes = [];
 
   // 并行拉取所有上游
@@ -4247,8 +4309,8 @@ async function fetchAllUpstreamsMerged(env) {
   for (const r of results) {
     if (r.status !== "fulfilled" || !r.value.ok) continue;
     for (const node of r.value.nodes) {
-      if (seenHosts.has(node.host)) continue;
-      seenHosts.add(node.host);
+      if (seenLines.has(node.raw)) continue;  // 完全相同才跳过
+      seenLines.add(node.raw);
       mergedNodes.push(node);
     }
   }
