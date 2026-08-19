@@ -15,9 +15,12 @@ let STORE_BOT_TOKEN = "YOUR_STORE_BOT_TOKEN";   // 前台公开售卖 Bot Token
 let ADMIN_ID = 0;                              // 管理员专属 Telegram 数字 ID (白名单)
 let DEFAULT_BRAND = "Maybe";                 // 节点默认品牌水印前缀
 let DEFAULT_UPSTREAM_URL = "YOUR_DEFAULT_UPSTREAM_URL"; // 默认上游订阅源（可被上游池覆盖）
+let STORE_ORIGIN = "";                        // 对外门户地址（env 注入，fallback 到请求 origin）
+let STORE_BOT_USERNAME = "";                  // 前台 Bot 用户名（env 注入，用于分销深链/客服链接）
+let SETUP_KEY = "";                           // /setup-webhooks 鉴权密钥（env 可选注入）
 const DEFAULT_DAYS = 30;                        // 默认套餐天数
 const REMINDER_DAYS = [3, 1, 0];                // 到期前 3 天 / 1 天 / 当天 提醒
-const STORE_ORIGIN = "https://wm.maybelosey.cc.cd"; // 对外门户地址
+const BOT_USERNAME_FALLBACK = "zzgmdybot";     // 兜底 Bot 用户名（仅当 env 未配置时）
 
 // 从环境变量加载配置（每个请求入口调用）
 function loadConfig(env) {
@@ -27,6 +30,20 @@ function loadConfig(env) {
   if (env.ADMIN_ID) ADMIN_ID = parseInt(env.ADMIN_ID);
   if (env.DEFAULT_UPSTREAM_URL) DEFAULT_UPSTREAM_URL = env.DEFAULT_UPSTREAM_URL;
   if (env.DEFAULT_BRAND) DEFAULT_BRAND = env.DEFAULT_BRAND;
+  if (env.STORE_ORIGIN) STORE_ORIGIN = env.STORE_ORIGIN.replace(/\/$/, "");
+  if (env.STORE_BOT_USERNAME) STORE_BOT_USERNAME = env.STORE_BOT_USERNAME.replace(/^@/, "");
+  if (env.SETUP_KEY) SETUP_KEY = env.SETUP_KEY;
+}
+
+// 获取前台 Bot 用户名（env 优先，否则兜底）
+function getStoreBotUsername() {
+  return STORE_BOT_USERNAME || BOT_USERNAME_FALLBACK;
+}
+
+// 获取对外门户地址（env 优先，否则用请求 origin）
+function getStoreOrigin(request) {
+  if (STORE_ORIGIN) return STORE_ORIGIN;
+  try { return new URL(request.url).origin; } catch (e) { return ""; }
 }
 // ==================== 套餐配置（可被 /plans 管理端命令修改，存 KV）====================
 const DEFAULT_PLANS = [
@@ -111,9 +128,9 @@ export default {
 // 每日运营日报
 async function sendDailyReport(env) {
   try {
-    // 统计所有记录
-    const records = await env.SUB_STORE.list({ prefix: "record_", limit: 1000 });
-    const users = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
+    // 统计所有记录（游标分页取全量）
+    const recordKeys = await listAllKeys(env, "record_", 5000);
+    const userKeys = await listAllKeys(env, "user_", 10000);
     const now = Date.now();
     const dayMs = 86400000;
     const todayStart = new Date().setHours(0, 0, 0, 0);
@@ -121,8 +138,8 @@ async function sendDailyReport(env) {
     // 昨日新增订单
     let yesterdayNew = 0, yesterdayRenew = 0, yesterdayCard = 0;
     let totalOrders = 0;
-    for (const k of records.keys) {
-      const r = JSON.parse(await env.SUB_STORE.get(k.name));
+    for (const k of recordKeys) {
+      const r = JSON.parse(await env.SUB_STORE.get(k));
       totalOrders++;
       if (r.time >= todayStart - dayMs && r.time < todayStart) {
         if (r.via === "card") yesterdayCard++;
@@ -134,21 +151,21 @@ async function sendDailyReport(env) {
     // 用户状态
     let active = 0, expired = 0, disabled = 0;
     const expiring7 = [];
-    for (const k of users.keys) {
-      const u = JSON.parse(await env.SUB_STORE.get(k.name));
+    for (const k of userKeys) {
+      const u = JSON.parse(await env.SUB_STORE.get(k));
       if (u.status === "disabled") disabled++;
       else if (now > u.expiry) expired++;
       else {
         active++;
-        if ((u.expiry - now) <= 7 * dayMs) expiring7.push(k.name.replace("user_", ""));
+        if ((u.expiry - now) <= 7 * dayMs) expiring7.push(k.replace("user_", ""));
       }
     }
 
     // 卡密库存
-    const cards = await env.SUB_STORE.list({ prefix: "card_", limit: 1000 });
+    const cardKeys = await listAllKeys(env, "card_", 10000);
     let cardUnused = 0;
-    for (const k of cards.keys) {
-      const c = JSON.parse(await env.SUB_STORE.get(k.name));
+    for (const k of cardKeys) {
+      const c = JSON.parse(await env.SUB_STORE.get(k));
       if (c.status === "unused") cardUnused++;
     }
 
@@ -169,6 +186,13 @@ async function sendDailyReport(env) {
 // ==================== 模块 0: Webhook 自注册 (/setup-webhooks) ====================
 async function handleWebhookSetup(request, env) {
   try {
+    // 鉴权：配置了 SETUP_KEY 时必须带 ?key= 才能操作，防止被恶意重置 webhook
+    if (SETUP_KEY) {
+      const url = new URL(request.url);
+      if (url.searchParams.get("key") !== SETUP_KEY) {
+        return new Response("Forbidden: invalid setup key", { status: 403 });
+      }
+    }
     const origin = new URL(request.url).origin;
     const storeWebhook = `${origin}/bot/store`;
     const adminWebhook = `${origin}/bot/admin`;
@@ -217,14 +241,14 @@ async function handleBuyerPortal(uid, request, env) {
     const disabled = user.status === "disabled";
     const statusColor = disabled ? "#f87171" : (expired ? "#fbbf24" : "#4ade80");
     const statusText = disabled ? "服务已暂停" : (expired ? "已过期" : "正常运行中");
-    const renewUrl = `${STORE_ORIGIN}/renew/${uid}`;
+    const renewUrl = `${getStoreOrigin(request)}/renew/${uid}`;
     const expireDate = new Date(user.expiry).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" });
     const plan = user.plan || "标准套餐";
     const price = user.price || "";
 
     // 客服配置
     const serviceContact = await env.SUB_STORE.get("service_contact") || "";
-    let serviceLink = "tg://resolve?domain=zzgmdybot";
+    let serviceLink = `tg://resolve?domain=${getStoreBotUsername()}`;
     if (serviceContact) {
       if (serviceContact.startsWith("@")) serviceLink = `tg://resolve?domain=${serviceContact.replace("@", "")}`;
       else if (serviceContact.startsWith("http")) serviceLink = serviceContact;
@@ -349,7 +373,7 @@ async function handleBuyerPortal(uid, request, env) {
         <p><b style="color:#38bdf8;">2. 其他客户端：</b>复制订阅地址，在客户端「添加订阅」中粘贴</p>
         <p><b style="color:#38bdf8;">3. 手机扫码：</b>展开「扫码导入」扫二维码</p>
         <p><b style="color:#38bdf8;">4. 到期续费：</b>到期前自动提醒，点续费按钮即可</p>
-        <p><b style="color:#38bdf8;">5. 卡密/优惠券：</b>在 @zzgmdybot 中兑换</p>
+        <p><b style="color:#38bdf8;">5. 卡密/优惠券：</b>在 @${getStoreBotUsername()} 中兑换</p>
       </div>
     </details>
     `}
@@ -496,7 +520,7 @@ async function handleRenewPage(uid, request, env) {
   const serviceContact = await env.SUB_STORE.get("service_contact") || "";
 
   // 构造客服链接
-  let serviceLink = "tg://resolve?domain=zzgmdybot"; // 默认前台 Bot
+  let serviceLink = `tg://resolve?domain=${getStoreBotUsername()}`; // 默认前台 Bot
   if (serviceContact) {
     if (serviceContact.startsWith("@")) {
       serviceLink = `tg://resolve?domain=${serviceContact.replace("@", "")}`;
@@ -578,15 +602,15 @@ async function handleRenewPage(uid, request, env) {
 
 // ==================== 模块 1.6: 分销推广落地页 (/r/{code}) ====================
 async function handleResellerLanding(code, request, env) {
-  // 查找分销商
-  const resellers = await env.SUB_STORE.list({ prefix: "reseller_", limit: 1000 });
+  // 查找分销商（游标分页）
+  const resellerKeys = await listAllKeys(env, "reseller_", 2000);
   let reseller = null;
   let resellerKey = null;
-  for (const k of resellers.keys) {
-    const r = JSON.parse(await env.SUB_STORE.get(k.name));
+  for (const k of resellerKeys) {
+    const r = JSON.parse(await env.SUB_STORE.get(k));
     if (r.code === code) {
       reseller = r;
-      resellerKey = k.name;
+      resellerKey = k;
       break;
     }
   }
@@ -627,8 +651,8 @@ async function handleResellerLanding(code, request, env) {
     <span class="badge">💰 专属优惠渠道</span>
     <h2>${reseller ? reseller.name : "推广链接"}</h2>
     <div class="desc">由分销商「${reseller ? reseller.name : "未知"}」为您推荐<br>${DEFAULT_BRAND} 高速节点服务</div>
-    <a class="btn" href="tg://resolve?domain=zzgmdybot&start=${code}">🚀 前往购买 (推荐人: ${reseller ? reseller.name : "—"})</a>
-    <a class="btn" href="${STORE_ORIGIN}">🌐 查看官网</a>
+    <a class="btn" href="tg://resolve?domain=${getStoreBotUsername()}&start=${code}">🚀 前往购买 (推荐人: ${reseller ? reseller.name : "—"})</a>
+    <a class="btn" href="${getStoreOrigin(request)}">🌐 查看官网</a>
     <div class="note">AETHERIA Power · 优质节点服务</div>
   </div>
 </body>
@@ -699,8 +723,14 @@ async function handleStoreBot(request, env) {
           return new Response("OK");
         }
 
-        // 生成订单
-        const orderId = "ORD-" + Math.floor(1000 + Math.random() * 9000);
+        // 频控：同一买家 5 秒内只能下一单，防刷
+        if (!(await rateLimit(env, "order", cbChatId, 5))) {
+          await answerCallback(STORE_BOT_TOKEN, cb.id, "⏳ 操作太快啦，请稍后再试");
+          return new Response("OK");
+        }
+
+        // 生成唯一订单号
+        const orderId = genOrderId();
         const photoParam = qrFileId.startsWith("http") ? qrFileId : qrFileId;
 
         // 收款码总数（多张时提示轮换）
@@ -751,6 +781,27 @@ async function handleStoreBot(request, env) {
 
     // 处理前台菜单
     if (text === "🛒 购买套餐" || text === "/start" || text === "/buy" || text.includes("购买")) {
+      // ===== 分销深链解析：tg://resolve?domain=xxx&start={code} =====
+      // 买家通过分销商推广链接进入时，Telegram 会带 start payload
+      if (text === "/start") {
+        const startPayload = (msg.text || "").split(" ")[1] || "";
+        if (startPayload) {
+          // 查找分销商并关联该买家
+          const resellers = await listAllKeys(env, "reseller_", 2000);
+          for (const k of resellers) {
+            try {
+              const r = JSON.parse(await env.SUB_STORE.get(k));
+              if (r.code === startPayload.toUpperCase()) {
+                await setBuyerAffiliate(env, chatId, r.code);
+                await sendTGText(STORE_BOT_TOKEN, chatId,
+                  `🎁 【推荐人已关联】\n您由分销商「${r.name}」推荐！\n购买后分销商将获得相应佣金。`);
+                break;
+              }
+            } catch (e) {}
+          }
+        }
+      }
+
       const plans = await getPlans(env);
       const displayQR = await getDisplayQR(env);
       const qrFileId = displayQR ? displayQR.fileId : null;
@@ -785,28 +836,17 @@ async function handleStoreBot(request, env) {
       return new Response("OK");
     }
 
-    // 查询订阅
+    // 查询订阅（走 chatId 反向索引，避免全表扫描）
     if (text === "🔍 查询订阅") {
-      // 查找该 ChatID 对应的用户
-      const result = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
-      const userKeys = result.keys.map(k => k.name);
-      let found = false;
-
-      for (const key of userKeys) {
-        const u = JSON.parse(await env.SUB_STORE.get(key));
-        if (u.chatId === chatId) {
-          const uid = key.replace("user_", "");
-          const remainDays = Math.ceil((u.expiry - Date.now()) / 86400000);
-          const stateDesc = u.status === "disabled" ? "🔴 禁用中" : (remainDays <= 0 ? "⏳ 已过期" : "🟢 正常运行");
-          await sendTGMenu(STORE_BOT_TOKEN, chatId,
-            `📊 【您的订阅信息】\n\n• 订阅编号: \`${uid}\`\n• 状态: ${stateDesc}\n• 剩余: ${Math.max(0, remainDays)} 天\n• 到期: ${new Date(u.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n\n🔗 管理面板:\n${STORE_ORIGIN}/s/${uid}`,
-            storeMenu);
-          found = true;
-          break;
-        }
-      }
-
-      if (!found) {
+      const uid = await findUidByChatId(env, chatId);
+      if (uid) {
+        const u = JSON.parse(await env.SUB_STORE.get(`user_${uid}`));
+        const remainDays = Math.ceil((u.expiry - Date.now()) / 86400000);
+        const stateDesc = u.status === "disabled" ? "🔴 禁用中" : (remainDays <= 0 ? "⏳ 已过期" : "🟢 正常运行");
+        await sendTGMenu(STORE_BOT_TOKEN, chatId,
+          `📊 【您的订阅信息】\n\n• 订阅编号: \`${uid}\`\n• 状态: ${stateDesc}\n• 剩余: ${Math.max(0, remainDays)} 天\n• 到期: ${new Date(u.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n\n🔗 管理面板:\n${getStoreOrigin(request)}/s/${uid}`,
+          storeMenu);
+      } else {
         await sendTGMenu(STORE_BOT_TOKEN, chatId, "❌ 您目前还没有订阅。\n点击下方【🛒 购买套餐】开始！", storeMenu);
       }
       return new Response("OK");
@@ -901,7 +941,7 @@ async function handleStoreBot(request, env) {
       const cResult = await redeemCoupon(env, cCode, chatId);
       await env.SUB_STORE.delete(`coupon_state_${chatId}`);
       if (cResult.ok) {
-        const origin = STORE_ORIGIN;
+        const origin = getStoreOrigin(request);
         await sendTGMenu(STORE_BOT_TOKEN, chatId,
           `${cResult.msg}！\n\n• 套餐: ${cResult.plan}\n• 时长: ${cResult.days} 天\n\n🔗 专属短链:\n\`${origin}/s/${cResult.uid}\``,
           storeMenu);
@@ -919,7 +959,7 @@ async function handleStoreBot(request, env) {
       const result = await redeemCard(env, code, chatId);
       await env.SUB_STORE.delete(`redeem_state_${chatId}`);
       if (result.ok) {
-        const origin = STORE_ORIGIN;
+        const origin = getStoreOrigin(request);
         await sendTGMenu(STORE_BOT_TOKEN, chatId,
           `${result.msg}！\n\n• 套餐: ${result.plan}\n• 时长: ${result.days} 天\n\n🔗 专属短链:\n\`${origin}/s/${result.uid}\``,
           storeMenu);
@@ -959,6 +999,17 @@ async function handleStoreBot(request, env) {
         await sendTGMenu(STORE_BOT_TOKEN, chatId, "🎫 请输入有效的卡密（格式：MB-XXXX-XXXX-XXXX）", storeMenu);
         return new Response("OK");
       }
+
+      // 付款意图识别：买家说"付了/已付款/转账了/发截图"等 → 引导发截图
+      const payKeywords = ["付了", "付款", "支付", "转账", "截图", "已付", "扫码付", "发了"];
+      const isPayIntent = payKeywords.some(k => text.includes(k));
+      if (isPayIntent) {
+        await sendTGMenu(STORE_BOT_TOKEN, chatId,
+          `📌 【提交付款凭证】\n\n请直接发送您的【转账截图/付款凭证图片】！\n\n系统会自动提交给管理员审核，审核通过后立即开通订阅。\n\n（如果已经发过截图，请耐心等待审核）`,
+          storeMenu);
+        return new Response("OK");
+      }
+
       // 普通咨询消息 → 引导使用菜单，不触发审核
       await sendTGMenu(STORE_BOT_TOKEN, chatId,
         `💬 收到您的消息！\n\n如需帮助请使用下方菜单：\n🛒 购买套餐 / 🔍 查询订阅 / 🎫 兑换卡密 / 📞 联系客服\n\n📌 温馨提示：付款成功后，请直接发送【转账截图/付款凭证图片】，系统会自动提交审核。`,
@@ -970,15 +1021,16 @@ async function handleStoreBot(request, env) {
     const buyerName = msg.from.first_name || "用户";
     const buyerUsername = msg.from.username ? `@${msg.from.username}` : "无";
 
-    // 尝试匹配该买家的最近待审订单，获取套餐信息
+    // 尝试匹配该买家的最近待审订单（取最新一笔），获取套餐信息
     let orderInfo = null;
     try {
-      const orders = await env.SUB_STORE.list({ prefix: "pending_", limit: 20 });
-      for (const k of orders.keys) {
-        const o = JSON.parse(await env.SUB_STORE.get(k.name));
-        if (o.chatId === chatId) {
+      const orderKeys = await listAllKeys(env, "pending_", 1000);
+      let newestTime = 0;
+      for (const k of orderKeys) {
+        const o = JSON.parse(await env.SUB_STORE.get(k));
+        if (o.chatId === chatId && (o.time || 0) > newestTime) {
           orderInfo = o;
-          break;
+          newestTime = o.time || 0;
         }
       }
     } catch (e) {}
@@ -1014,7 +1066,8 @@ async function handleStoreBot(request, env) {
     const replyMarkup = {
       inline_keyboard: [
         [
-          { text: "🟢 确认到账 · 一键开通", callback_data: `approve_${chatId}` },
+          // 回调带上订单号，确认时精确匹配对应订单，避免多订单混淆
+          { text: "🟢 确认到账 · 一键开通", callback_data: `approve_${chatId}_${orderInfo ? orderInfo.orderId : "0"}` },
           { text: "⏳ 稍后处理", callback_data: "later" }
         ]
       ]
@@ -1058,13 +1111,15 @@ const MAIN_MENU = {
 
 // 到期提醒扫描（Cron 调用）
 async function checkExpiringSubscriptions(env) {
-  const result = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
+  const userKeys = await listAllKeys(env, "user_", 10000);
   const now = Date.now();
   const day = 86400000;
+  // Cron 场景没有 request，续费链接用 env 配置的门户地址（STORE_ORIGIN 为空时用空链接提示）
+  const originBase = STORE_ORIGIN || "";
 
-  for (const k of result.keys) {
-    const uid = k.name.replace("user_", "");
-    const u = JSON.parse(await env.SUB_STORE.get(k.name));
+  for (const k of userKeys) {
+    const uid = k.replace("user_", "");
+    const u = JSON.parse(await env.SUB_STORE.get(k));
     if (u.status !== "active") continue;
     if (!u.chatId) continue;
 
@@ -1079,11 +1134,11 @@ async function checkExpiringSubscriptions(env) {
         // 通知买家（通过前台 bot）
         if (remindDay > 0) {
           await sendTGText(STORE_BOT_TOKEN, u.chatId,
-            `⏰ 【到期提醒】\n您的订阅将于 ${remindDay} 天后到期！\n\n请及时续费以免影响使用。\n\n📱 快速续费: ${STORE_ORIGIN}/renew/${uid}`
+            `⏰ 【到期提醒】\n您的订阅将于 ${remindDay} 天后到期！\n\n请及时续费以免影响使用。\n\n📱 快速续费: ${originBase}/renew/${uid}`
           );
         } else {
           await sendTGText(STORE_BOT_TOKEN, u.chatId,
-            `⏰ 【到期提醒】\n您的订阅今天到期！\n\n请尽快续费以免服务中断。\n\n📱 快速续费: ${STORE_ORIGIN}/renew/${uid}`
+            `⏰ 【到期提醒】\n您的订阅今天到期！\n\n请尽快续费以免服务中断。\n\n📱 快速续费: ${originBase}/renew/${uid}`
           );
         }
 
@@ -1119,19 +1174,32 @@ async function handleAdminBot(request, env) {
 
       // 确认到账 → 开通（区分新购/续费）
       // 幂等保护：每个凭证通知消息只处理一次，防止重复点击重复加天数
+      // 回调格式：approve_{chatId}_{orderId}（orderId 可选，兼容旧按钮）
       if (data.startsWith("approve_")) {
-        const targetChatId = data.replace("approve_", "");
+        const parts = data.split("_");
+        const targetChatId = parts[1];
+        const approveOrderId = parts.slice(2).join("_") || null; // 订单号可能含特殊字符，用 join 保留
+        const targetChatIdNum = parseInt(targetChatId);
         const defaultUpstream = await getDefaultUpstream(env);
 
-        // 读取该买家的待审订单（获取套餐信息），没有则用默认配置
+        // 读取该买家的待审订单（优先精确匹配回调带上的订单号，其次取最新一笔）
         let orderPlan = null;
         try {
-          const orders = await env.SUB_STORE.list({ prefix: "pending_", limit: 20 });
-          for (const k of orders.keys) {
-            const o = JSON.parse(await env.SUB_STORE.get(k.name));
-            if (o.chatId === parseInt(targetChatId)) {
-              orderPlan = o;
-              break;
+          const orderKeys = await listAllKeys(env, "pending_", 1000);
+          let newestTime = 0;
+          for (const k of orderKeys) {
+            const o = JSON.parse(await env.SUB_STORE.get(k));
+            if (o.chatId === targetChatIdNum) {
+              if (approveOrderId && approveOrderId !== "0" && o.orderId === approveOrderId) {
+                orderPlan = o; // 精确匹配
+                break;
+              }
+              if (!approveOrderId || approveOrderId === "0") {
+                if ((o.time || 0) > newestTime) {
+                  orderPlan = o; // 取最新一笔
+                  newestTime = o.time || 0;
+                }
+              }
             }
           }
         } catch (e) {}
@@ -1154,16 +1222,8 @@ async function handleAdminBot(request, env) {
           // 标记已处理（防重复）
           await env.SUB_STORE.put(processedKey, JSON.stringify({ chatId: targetChatId, time: Date.now() }), { expirationTtl: 86400 });
 
-          // 检查该 ChatID 是否已有订阅（续费场景）
-          const result = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
-          let existingUid = null;
-          for (const k of result.keys) {
-            const u = JSON.parse(await env.SUB_STORE.get(k.name));
-            if (u.chatId === parseInt(targetChatId)) {
-              existingUid = k.name.replace("user_", "");
-              break;
-            }
-          }
+          // 检查该 ChatID 是否已有订阅（续费场景）——走索引
+          const existingUid = await findUidByChatId(env, targetChatIdNum);
 
           let finalUid;
           let prevExpiry = null;
@@ -1178,8 +1238,8 @@ async function handleAdminBot(request, env) {
             await env.SUB_STORE.put(`user_${existingUid}`, JSON.stringify(existing));
             finalUid = existingUid;
           } else {
-            // 新购：创建新订阅
-            const newUid = Math.floor(1000 + Math.random() * 9000).toString();
+            // 新购：创建新订阅（唯一 UID）
+            const newUid = await genUniqueUid(env);
             finalUid = newUid;
             const expiry = Date.now() + (days * 86400000);
             await env.SUB_STORE.put(`user_${newUid}`, JSON.stringify({
@@ -1187,17 +1247,19 @@ async function handleAdminBot(request, env) {
               expiry,
               status: "active",
               brand: DEFAULT_BRAND,
-              chatId: parseInt(targetChatId),
+              chatId: targetChatIdNum,
               createdAt: Date.now(),
               plan: planLabel
             }));
+            await indexUserChatId(env, targetChatIdNum, newUid); // 写 chatId 索引
           }
 
           // 记录订单流水
           if (orderPlan) {
+            const recordKey = `record_${Date.now()}`;
             const record = {
-              orderId: orderPlan.orderId || ("ORD-" + Math.floor(1000 + Math.random() * 9000)),
-              chatId: parseInt(targetChatId),
+              orderId: orderPlan.orderId || genOrderId(),
+              chatId: targetChatIdNum,
               plan: planLabel,
               days,
               price: orderPlan.planPrice || "",
@@ -1205,16 +1267,23 @@ async function handleAdminBot(request, env) {
               uid: finalUid,
               type: existingUid ? "renew" : "new"
             };
-            await env.SUB_STORE.put(`record_${Date.now()}`, JSON.stringify(record), { expirationTtl: 15552000 });
+            await env.SUB_STORE.put(recordKey, JSON.stringify(record), { expirationTtl: 15552000 });
+
+            // 清理该笔待审订单（避免脏数据）
+            try { await env.SUB_STORE.delete(`pending_${orderPlan.orderId}`); } catch (e) {}
+
+            // 分销佣金结算（分销商推荐购买的订单）
+            await creditReseller(env, targetChatIdNum, orderPlan.planPrice);
           }
 
-          // 保存操作前的状态，供撤销使用
+          // 保存操作前的状态，供撤销使用（含订单号，撤销时删对应流水）
           await env.SUB_STORE.put(`revoke_${cb.message.message_id}`, JSON.stringify({
             uid: finalUid,
-            chatId: parseInt(targetChatId),
+            chatId: targetChatIdNum,
             prevExpiry: prevExpiry,
             isNew: !existingUid,
             days,
+            orderId: orderPlan ? orderPlan.orderId : null,
             time: Date.now()
           }), { expirationTtl: 86400 });
 
@@ -1238,7 +1307,7 @@ async function handleAdminBot(request, env) {
             const markup = {
               inline_keyboard: [
                 [
-                  { text: "🟢 确认到账 · 一键开通", callback_data: `approve_${targetChatId}` },
+                  { text: "🟢 确认到账 · 一键开通", callback_data: `approve_${targetChatId}_${approveOrderId || "0"}` },
                   { text: "⏳ 稍后处理", callback_data: "later" }
                 ],
                 [
@@ -1266,6 +1335,7 @@ async function handleAdminBot(request, env) {
           const d = JSON.parse(dStr);
           // 恢复用户数据
           await env.SUB_STORE.put(`user_${d.uid}`, JSON.stringify(d.data));
+          await indexUserChatId(env, d.data.chatId, d.uid); // 恢复 chatId 索引
           await env.SUB_STORE.delete(`revoke_del_${dId}`);
           replyText = `↩️ 已恢复！用户 UID:${d.uid} 已还原`;
         }
@@ -1284,8 +1354,10 @@ async function handleAdminBot(request, env) {
           if (!userDataStr) {
             replyText = `❌ 用户 UID:${m.uid} 不存在或已删除`;
           } else {
+            const mUser = JSON.parse(userDataStr);
             await env.SUB_STORE.delete(`user_${m.uid}`);
             await env.SUB_STORE.delete(`cache_${m.uid}`);
+            await unindexUserChatId(env, mUser.chatId); // 清理 chatId 索引
             // 通知买家
             try {
               await sendTGText(STORE_BOT_TOKEN, m.chatId,
@@ -1336,6 +1408,7 @@ async function handleAdminBot(request, env) {
               // 新购撤销：删除该用户
               await env.SUB_STORE.delete(`user_${rev.uid}`);
               await env.SUB_STORE.delete(`cache_${rev.uid}`);
+              await unindexUserChatId(env, rev.chatId); // 清理 chatId 索引
               // 通知买家
               await sendTGText(STORE_BOT_TOKEN, rev.chatId,
                 `⚠️ 【开通已撤销】\n管理员撤销了刚才的开通操作。\n如您已付款请联系客服核实。`
@@ -1352,6 +1425,21 @@ async function handleAdminBot(request, env) {
               );
               replyText = `↩️ 已撤销！UID:${rev.uid} 已恢复原到期时间`;
             }
+            // 撤销时同步删除对应的订单流水，保证账实一致
+            if (rev.orderId) {
+              try {
+                const recKeys = await listAllKeys(env, "record_", 2000);
+                for (const rk of recKeys) {
+                  try {
+                    const r = JSON.parse(await env.SUB_STORE.get(rk));
+                    if (r.orderId === rev.orderId) {
+                      await env.SUB_STORE.delete(rk);
+                      break;
+                    }
+                  } catch (e) {}
+                }
+              } catch (e) {}
+            }
             // 删除撤销记录，防止重复撤销
             await env.SUB_STORE.delete(`revoke_${msgId}`);
           }
@@ -1361,14 +1449,15 @@ async function handleAdminBot(request, env) {
       // 撤销删除：从最近的删除记录恢复
       else if (data.startsWith("undel_")) {
         const uid = data.replace("undel_", "");
-        // 查找该用户的最近删除记录
-        const dels = await env.SUB_STORE.list({ prefix: "revoke_del_", limit: 1000 });
+        // 查找该用户的最近删除记录（游标分页）
+        const delKeys = await listAllKeys(env, "revoke_del_", 2000);
         let found = false;
-        for (const k of dels.keys) {
-          const d = JSON.parse(await env.SUB_STORE.get(k.name));
+        for (const k of delKeys) {
+          const d = JSON.parse(await env.SUB_STORE.get(k));
           if (d.uid === uid) {
             await env.SUB_STORE.put(`user_${uid}`, JSON.stringify(d.data));
-            await env.SUB_STORE.delete(k.name);
+            await indexUserChatId(env, d.data.chatId, uid); // 恢复索引
+            await env.SUB_STORE.delete(k);
             found = true;
             break;
           }
@@ -1411,6 +1500,7 @@ async function handleAdminBot(request, env) {
             }), { expirationTtl: 86400 });
             await env.SUB_STORE.delete(`user_${uid}`);
             await env.SUB_STORE.delete(`cache_${uid}`);
+            await unindexUserChatId(env, u.chatId); // 清理 chatId 索引
             await logAction(env, "删除用户", `UID:${uid} ChatID:${u.chatId || "-"}`);
             replyText = `🗑️ 用户 [${uid}] 已删除！\n\n如需恢复请点击下方按钮：`;
             replyMarkup = { inline_keyboard: [[{ text: "↩️ 恢复用户", callback_data: `undel_${uid}` }]] };
@@ -1418,11 +1508,11 @@ async function handleAdminBot(request, env) {
         }
       }
 
-      // 用户列表翻页
+      // 用户列表翻页（游标分页取全量）
       else if (data.startsWith("ulist_")) {
         const page = parseInt(data.replace("ulist_", "")) || 1;
-        const result = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
-        const allUsers = result.keys.map(k => k.name.replace("user_", ""));
+        const userKeys = await listAllKeys(env, "user_", 10000);
+        const allUsers = userKeys.map(k => k.replace("user_", ""));
         const totalPages = Math.max(1, Math.ceil(allUsers.length / 5));
         const start = (page - 1) * 5;
         const pageUsers = allUsers.slice(start, start + 5);
@@ -1443,17 +1533,17 @@ async function handleAdminBot(request, env) {
         replyMarkup = { inline_keyboard: navBtns.length ? [navBtns] : [] };
       }
 
-      // 待审核订单
+      // 待审核订单（游标分页取全量）
       else if (data === "pending_orders") {
-        const result = await env.SUB_STORE.list({ prefix: "pending_", limit: 20 });
-        if (result.keys.length === 0) {
+        const orderKeys = await listAllKeys(env, "pending_", 2000);
+        if (orderKeys.length === 0) {
           replyAlert = "📭 当前没有待审核订单";
         } else {
-          let ordersText = `📦 【待审核订单】 (${result.keys.length})\n\n`;
-          for (const k of result.keys) {
-            const order = JSON.parse(await env.SUB_STORE.get(k.name));
+          let ordersText = `📦 【待审核订单】 (${orderKeys.length})\n\n`;
+          for (const k of orderKeys.slice(0, 20)) {
+            const order = JSON.parse(await env.SUB_STORE.get(k));
             const timeStr = new Date(order.time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-            ordersText += `• ${k.name.replace("pending_", "")} (${order.type === "renew" ? "续费" : "新购"})\n  买家: ${order.chatId}\n  ${timeStr}\n`;
+            ordersText += `• ${k.replace("pending_", "")} (${order.type === "renew" ? "续费" : "新购"})\n  买家: ${order.chatId}\n  ${timeStr}\n`;
           }
           replyAlert = ordersText;
         }
@@ -1542,7 +1632,7 @@ async function handleAdminBot(request, env) {
               }
             }
             await env.SUB_STORE.delete("admin_action_state");
-            replyText = `✅ 已生成 ${qty} 张卡密（${days} 天）\n\n买家在 @zzgmdybot 点【🎫 兑换卡密】即可兑换！`;
+            replyText = `✅ 已生成 ${qty} 张卡密（${days} 天）\n\n买家在 @${getStoreBotUsername()} 点【🎫 兑换卡密】即可兑换！`;
           }
         }
       }
@@ -1620,16 +1710,30 @@ async function handleAdminBot(request, env) {
         replyAlert = "❌ 已取消操作，提示消息已清除";
       }
 
+      // 删除分销商
+      else if (data.startsWith("delreseller_")) {
+        const rId = data.replace("delreseller_", "");
+        const rStr = await env.SUB_STORE.get(`reseller_${rId}`);
+        if (!rStr) {
+          replyText = "❌ 分销商不存在或已删除";
+        } else {
+          const r = JSON.parse(rStr);
+          await env.SUB_STORE.delete(`reseller_${rId}`);
+          await logAction(env, "删除分销商", `${r.name} (${r.code}) 佣金${r.commission || 0}元`);
+          replyText = `🗑️ 分销商 [${r.name}] 已删除！\n（累计佣金 ${r.commission || 0} 元已作废）`;
+        }
+      }
+
       // 分销：查看佣金统计
       else if (data === "reseller_stats") {
-        const resellers = (await env.SUB_STORE.list({ prefix: "reseller_", limit: 1000 })).keys;
-        if (resellers.length === 0) {
+        const resellerKeys = await listAllKeys(env, "reseller_", 2000);
+        if (resellerKeys.length === 0) {
           replyAlert = "📭 当前还没有分销商";
         } else {
           let text = `💰 【分销商列表】\n\n`;
-          for (const k of resellers) {
-            const r = JSON.parse(await env.SUB_STORE.get(k.name));
-            text += `• ${r.name || k.name.replace("reseller_", "")}\n  邀请码: ${r.code}\n  佣金: ${r.commission || 0} 元\n`;
+          for (const k of resellerKeys) {
+            const r = JSON.parse(await env.SUB_STORE.get(k));
+            text += `• ${r.name || k.replace("reseller_", "")}\n  邀请码: ${r.code}\n  佣金: ${r.commission || 0} 元\n`;
           }
           replyAlert = text;
         }
@@ -1668,7 +1772,7 @@ async function handleAdminBot(request, env) {
     if (actionState && actionState.mode === "newuser" && /^\d+$/.test(text)) {
       const targetChatId = parseInt(text);
       const days = actionState.days;
-      const newUid = Math.floor(1000 + Math.random() * 9000).toString();
+      const newUid = await genUniqueUid(env); // 唯一 UID
       const upstream = await getDefaultUpstream(env);
       const expiry = Date.now() + (days * 86400000);
 
@@ -1681,6 +1785,7 @@ async function handleAdminBot(request, env) {
         createdAt: Date.now(),
         plan: `${days} 天套餐`
       }));
+      await indexUserChatId(env, targetChatId, newUid); // 写 chatId 索引
 
       const origin = new URL(request.url).origin;
       const subLink = `${origin}/s/${newUid}`;
@@ -1844,11 +1949,11 @@ async function handleAdminBot(request, env) {
       if (!keyword) {
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 关键词无效", MAIN_MENU);
       } else {
-        const users = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
+        const userKeys = await listAllKeys(env, "user_", 10000);
         const matches = [];
-        for (const k of users.keys) {
-          const uid = k.name.replace("user_", "");
-          const u = JSON.parse(await env.SUB_STORE.get(k.name));
+        for (const k of userKeys) {
+          const uid = k.replace("user_", "");
+          const u = JSON.parse(await env.SUB_STORE.get(k));
           const haystack = `${uid} ${u.note || ""} ${u.plan || ""} ${u.chatId || ""}`.toLowerCase();
           if (haystack.includes(keyword)) {
             matches.push({ uid, u });
@@ -1872,23 +1977,23 @@ async function handleAdminBot(request, env) {
 
     // 用户统计
     if (text === "📊 用户统计") {
-      const users = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
+      const userKeys = await listAllKeys(env, "user_", 10000);
       let active = 0, expired = 0, disabled = 0;
       const expiringSoon = []; // 7 天内到期
       const now = Date.now();
-      for (const k of users.keys) {
-        const u = JSON.parse(await env.SUB_STORE.get(k.name));
+      for (const k of userKeys) {
+        const u = JSON.parse(await env.SUB_STORE.get(k));
         if (u.status === "disabled") disabled++;
         else if (now > u.expiry) expired++;
         else {
           active++;
           const remainDays = Math.ceil((u.expiry - now) / 86400000);
-          if (remainDays <= 7) expiringSoon.push(k.name.replace("user_", ""));
+          if (remainDays <= 7) expiringSoon.push(k.replace("user_", ""));
         }
       }
       await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
         `📊 【用户统计】\n\n` +
-        `👥 用户总数: ${users.keys.length}\n` +
+        `👥 用户总数: ${userKeys.length}\n` +
         `🟢 正常: ${active}\n` +
         `⏳ 已过期: ${expired}\n` +
         `🔴 已禁用: ${disabled}\n` +
@@ -1899,15 +2004,15 @@ async function handleAdminBot(request, env) {
 
     // 即将到期用户
     if (text === "⏳ 即将到期") {
-      const users = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
+      const userKeys = await listAllKeys(env, "user_", 10000);
       const now = Date.now();
       const expiring = [];
-      for (const k of users.keys) {
-        const u = JSON.parse(await env.SUB_STORE.get(k.name));
+      for (const k of userKeys) {
+        const u = JSON.parse(await env.SUB_STORE.get(k));
         if (u.status !== "active") continue;
         const remainDays = Math.ceil((u.expiry - now) / 86400000);
         if (remainDays <= 7 && remainDays > 0) {
-          expiring.push({ uid: k.name.replace("user_", ""), remainDays, chatId: u.chatId });
+          expiring.push({ uid: k.replace("user_", ""), remainDays, chatId: u.chatId });
         }
       }
       expiring.sort((a, b) => a.remainDays - b.remainDays);
@@ -2089,14 +2194,14 @@ async function handleAdminBot(request, env) {
 
     // 导出名单
     if (text === "📤 导出名单") {
-      const users = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
-      if (users.keys.length === 0) {
+      const userKeys = await listAllKeys(env, "user_", 10000);
+      if (userKeys.length === 0) {
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有任何用户", MAIN_MENU);
       } else {
         const lines = ["UID | ChatID | 状态 | 剩余天数 | 到期 | 备注"];
-        for (const k of users.keys) {
-          const uid = k.name.replace("user_", "");
-          const u = JSON.parse(await env.SUB_STORE.get(k.name));
+        for (const k of userKeys) {
+          const uid = k.replace("user_", "");
+          const u = JSON.parse(await env.SUB_STORE.get(k));
           const remain = Math.ceil((u.expiry - Date.now()) / 86400000);
           const state = u.status === "disabled" ? "禁用" : (remain <= 0 ? "过期" : "正常");
           const exp = new Date(u.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
@@ -2109,7 +2214,7 @@ async function handleAdminBot(request, env) {
           const chunk = lines.slice(i, i + chunkSize).join("\n");
           await sendTGText(ADMIN_BOT_TOKEN, chatId, "```\n" + chunk + "\n```");
         }
-        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `📤 【导出完成】\n共 ${users.keys.length} 位用户，已分块发送`, MAIN_MENU);
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `📤 【导出完成】\n共 ${userKeys.length} 位用户，已分块发送`, MAIN_MENU);
       }
       return new Response("OK");
     }
@@ -2172,8 +2277,8 @@ async function handleAdminBot(request, env) {
 
     // 用户列表
     if (text === "📋 用户列表") {
-      const result = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
-      const allUsers = result.keys.map(k => k.name.replace("user_", ""));
+      const userKeys = await listAllKeys(env, "user_", 10000);
+      const allUsers = userKeys.map(k => k.replace("user_", ""));
       const totalPages = Math.max(1, Math.ceil(allUsers.length / 5));
 
       if (allUsers.length === 0) {
@@ -2247,14 +2352,14 @@ async function handleAdminBot(request, env) {
 
     // 收款流水
     if (text === "🧾 收款流水") {
-      const records = await env.SUB_STORE.list({ prefix: "record_", limit: 1000 });
-      if (records.keys.length === 0) {
+      const recKeys = await listAllKeys(env, "record_", 5000);
+      if (recKeys.length === 0) {
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "📭 暂无收款流水", MAIN_MENU);
       } else {
         // 按时间倒序
         const recs = [];
-        for (const k of records.keys) {
-          recs.push(JSON.parse(await env.SUB_STORE.get(k.name)));
+        for (const k of recKeys) {
+          recs.push(JSON.parse(await env.SUB_STORE.get(k)));
         }
         recs.sort((a, b) => (b.time || 0) - (a.time || 0));
 
@@ -2278,15 +2383,15 @@ async function handleAdminBot(request, env) {
 
     // 待审核订单列表
     if (text === "⏳ 待审核订单") {
-      const result = await env.SUB_STORE.list({ prefix: "pending_", limit: 20 });
-      if (result.keys.length === 0) {
+      const orderKeys = await listAllKeys(env, "pending_", 2000);
+      if (orderKeys.length === 0) {
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有待审核订单", MAIN_MENU);
       } else {
-        let ordersText = `📦 【待审核订单】 (${result.keys.length})\n\n`;
-        for (const k of result.keys) {
-          const order = JSON.parse(await env.SUB_STORE.get(k.name));
+        let ordersText = `📦 【待审核订单】 (${orderKeys.length})\n\n`;
+        for (const k of orderKeys.slice(0, 20)) {
+          const order = JSON.parse(await env.SUB_STORE.get(k));
           const timeStr = new Date(order.time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-          ordersText += `• ${k.name.replace("pending_", "")} (${order.type === "renew" ? "续费" : "新购"})\n  买家: ${order.chatId}\n  ${timeStr}\n`;
+          ordersText += `• ${k.replace("pending_", "")} (${order.type === "renew" ? "续费" : "新购"})\n  买家: ${order.chatId}\n  ${timeStr}\n`;
         }
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, ordersText, MAIN_MENU);
       }
@@ -2295,13 +2400,13 @@ async function handleAdminBot(request, env) {
 
     // 已处理订单历史
     if (text === "📋 已处理订单") {
-      const result = await env.SUB_STORE.list({ prefix: "processed_", limit: 20 });
-      if (result.keys.length === 0) {
+      const procKeys = await listAllKeys(env, "processed_", 2000);
+      if (procKeys.length === 0) {
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "📭 暂无已处理订单记录", MAIN_MENU);
       } else {
-        let ordersText = `📋 【已处理订单】 (最近 ${result.keys.length} 条)\n\n`;
-        for (const k of result.keys) {
-          const order = JSON.parse(await env.SUB_STORE.get(k.name));
+        let ordersText = `📋 【已处理订单】 (最近 ${Math.min(procKeys.length, 20)} 条)\n\n`;
+        for (const k of procKeys.slice(-20)) {
+          const order = JSON.parse(await env.SUB_STORE.get(k));
           const timeStr = new Date(order.time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
           ordersText += `• 买家 ChatID: ${order.chatId}\n  ${timeStr}\n`;
         }
@@ -2523,15 +2628,15 @@ async function handleAdminBot(request, env) {
       if (arg === "on") {
         await env.SUB_STORE.put("merge_mode", "on");
         // 清理所有缓存生效
-        const caches = await env.SUB_STORE.list({ prefix: "cache_", limit: 1000 });
-        for (const k of caches.keys) await env.SUB_STORE.delete(k.name);
+        const cacheKeys = await listAllKeys(env, "cache_", 10000);
+        for (const k of cacheKeys) await env.SUB_STORE.delete(k);
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
           `🔄 【合并模式已开启】\n\n所有买家订阅将合并上游池中全部节点的线路！\n（已清除缓存，立即生效）`,
           MAIN_MENU);
       } else if (arg === "off") {
         await env.SUB_STORE.put("merge_mode", "off");
-        const caches = await env.SUB_STORE.list({ prefix: "cache_", limit: 1000 });
-        for (const k of caches.keys) await env.SUB_STORE.delete(k.name);
+        const cacheKeys = await listAllKeys(env, "cache_", 10000);
+        for (const k of cacheKeys) await env.SUB_STORE.delete(k);
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
           `➡️ 【合并模式已关闭】\n\n恢复为按用户分配单个上游。`,
           MAIN_MENU);
@@ -2706,7 +2811,7 @@ async function handleAdminBot(request, env) {
           }
         }
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
-          `✅ 已生成 ${qty} 张卡密（${days} 天）\n\n买家在 @zzgmdybot 点【🎫 兑换卡密】即可兑换！`,
+          `✅ 已生成 ${qty} 张卡密（${days} 天）\n\n买家在 @${getStoreBotUsername()} 点【🎫 兑换卡密】即可兑换！`,
           MAIN_MENU);
       }
       return new Response("OK");
@@ -2790,7 +2895,7 @@ async function handleAdminBot(request, env) {
         }
       }
       await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
-        `🎁 【优惠券已生成】\n\n• 数量: ${count}\n• 时长: ${days} 天\n• 折扣: ${discount}%\n• 备注: ${note}\n\n买家在 @zzgmdybot 点【🎁 优惠券】即可兑换！`,
+        `🎁 【优惠券已生成】\n\n• 数量: ${count}\n• 时长: ${days} 天\n• 折扣: ${discount}%\n• 备注: ${note}\n\n买家在 @${getStoreBotUsername()} 点【🎁 优惠券】即可兑换！`,
         MAIN_MENU);
       return new Response("OK");
     }
@@ -2819,11 +2924,11 @@ async function handleAdminBot(request, env) {
 
     // 卡密统计
     if (text === "📋 卡密统计") {
-      const cards = await env.SUB_STORE.list({ prefix: "card_", limit: 1000 });
+      const cardKeys = await listAllKeys(env, "card_", 10000);
       let total = 0, unused = 0, used = 0, disabled = 0;
-      for (const k of cards.keys) {
+      for (const k of cardKeys) {
         total++;
-        const c = JSON.parse(await env.SUB_STORE.get(k.name));
+        const c = JSON.parse(await env.SUB_STORE.get(k));
         if (c.status === "used") used++;
         else if (c.status === "disabled") disabled++;
         else unused++;
@@ -2852,12 +2957,12 @@ async function handleAdminBot(request, env) {
 
     // 清理已用卡密
     if (text === "🗑️ 清理已用卡密") {
-      const cards = await env.SUB_STORE.list({ prefix: "card_", limit: 1000 });
+      const cardKeys = await listAllKeys(env, "card_", 10000);
       let deleted = 0;
-      for (const k of cards.keys) {
-        const c = JSON.parse(await env.SUB_STORE.get(k.name));
+      for (const k of cardKeys) {
+        const c = JSON.parse(await env.SUB_STORE.get(k));
         if (c.status === "used") {
-          await env.SUB_STORE.delete(k.name);
+          await env.SUB_STORE.delete(k);
           deleted++;
         }
       }
@@ -2896,7 +3001,7 @@ async function handleAdminBot(request, env) {
       if (msgCount === 0) {
         await sendTGText(ADMIN_BOT_TOKEN, chatId, sentMsg + "```\n" + cardText + "```");
       }
-      await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `✅ 已生成 ${count} 张卡密，请复制上方卡密发放给买家。\n\n买家在 @zzgmdybot 发送「🎫 兑换卡密」即可自助兑换！`, MAIN_MENU);
+      await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `✅ 已生成 ${count} 张卡密，请复制上方卡密发放给买家。\n\n买家在 @${getStoreBotUsername()} 发送「🎫 兑换卡密」即可自助兑换！`, MAIN_MENU);
       return new Response("OK");
     }
 
@@ -2916,11 +3021,11 @@ async function handleAdminBot(request, env) {
           `🎫 【卡密信息】\n\n• 卡密: \`${c.code}\`\n• 套餐: ${c.planName}\n• 时长: ${c.days} 天\n• 价格: ${c.price || "未设置"}\n• 状态: ${statusDesc}`,
           MAIN_MENU);
       } else {
-        // 模糊搜索
-        const all = await env.SUB_STORE.list({ prefix: "card_", limit: 1000 });
+        // 模糊搜索（游标分页）
+        const cardKeys = await listAllKeys(env, "card_", 10000);
         const matches = [];
-        for (const k of all.keys) {
-          const c = JSON.parse(await env.SUB_STORE.get(k.name));
+        for (const k of cardKeys) {
+          const c = JSON.parse(await env.SUB_STORE.get(k));
           if (c.code.includes(q)) matches.push(c);
         }
         if (matches.length > 0) {
@@ -2942,6 +3047,7 @@ async function handleAdminBot(request, env) {
         keyboard: [
           [{ text: "📋 分销商列表" }, { text: "➕ 创建分销商" }],
           [{ text: "📈 设置佣金比例" }, { text: "🔗 推广链接" }],
+          [{ text: "🗑️ 删除分销商" }],
           [{ text: "🏠 返回主菜单" }]
         ],
         resize_keyboard: true,
@@ -2982,14 +3088,14 @@ async function handleAdminBot(request, env) {
 
     // 推广链接
     if (text === "🔗 推广链接") {
-      const resellers = (await env.SUB_STORE.list({ prefix: "reseller_", limit: 1000 })).keys;
-      if (resellers.length === 0) {
+      const resellerKeys = await listAllKeys(env, "reseller_", 2000);
+      if (resellerKeys.length === 0) {
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "📭 请先创建分销商", MAIN_MENU);
       } else {
         let msg = `🔗 【分销商推广链接】\n\n`;
-        for (const k of resellers) {
-          const r = JSON.parse(await env.SUB_STORE.get(k.name));
-          msg += `• ${r.name}\n  推广码: \`${r.code}\`\n  链接: ${STORE_ORIGIN}/r/${r.code}\n\n`;
+        for (const k of resellerKeys) {
+          const r = JSON.parse(await env.SUB_STORE.get(k));
+          msg += `• ${r.name}\n  推广码: \`${r.code}\`\n  链接: ${getStoreOrigin(request)}/r/${r.code}\n\n`;
         }
         msg += `买家打开链接会自动关联该分销商。`;
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, msg, MAIN_MENU);
@@ -2999,16 +3105,42 @@ async function handleAdminBot(request, env) {
 
     // 分销商列表
     if (text === "📋 分销商列表") {
-      const resellers = (await env.SUB_STORE.list({ prefix: "reseller_", limit: 1000 })).keys;
-      if (resellers.length === 0) {
+      const resellerKeys = await listAllKeys(env, "reseller_", 2000);
+      if (resellerKeys.length === 0) {
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前还没有分销商\n点击【➕ 创建分销商】添加", MAIN_MENU);
       } else {
         let textMsg = `💰 【分销商列表】\n\n`;
-        for (const k of resellers) {
-          const r = JSON.parse(await env.SUB_STORE.get(k.name));
-          textMsg += `• ${r.name || k.name.replace("reseller_", "")}\n  邀请码: \`${r.code}\`\n  推广点击: ${r.clicks || 0}\n  佣金: ${r.commission || 0} 元\n`;
+        for (const k of resellerKeys) {
+          const r = JSON.parse(await env.SUB_STORE.get(k));
+          textMsg += `• ${r.name || k.replace("reseller_", "")}\n  邀请码: \`${r.code}\`\n  推广点击: ${r.clicks || 0}\n  成交订单: ${r.orders || 0}\n  佣金: ${r.commission || 0} 元\n`;
         }
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, textMsg, MAIN_MENU);
+      }
+      return new Response("OK");
+    }
+
+    // 删除分销商（第一步：显示列表供选择）
+    if (text === "🗑️ 删除分销商") {
+      const resellerKeys = await listAllKeys(env, "reseller_", 2000);
+      if (resellerKeys.length === 0) {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前还没有分销商", MAIN_MENU);
+      } else {
+        const btns = [];
+        for (const k of resellerKeys) {
+          const r = JSON.parse(await env.SUB_STORE.get(k));
+          const rId = k.replace("reseller_", "");
+          btns.push([{ text: `${r.name} (${r.code})`, callback_data: `delreseller_${rId}` }]);
+        }
+        btns.push([{ text: "❌ 取消", callback_data: "cancel_action" }]);
+        await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: `🗑️ 【删除分销商】\n请选择要删除的分销商：`,
+            reply_markup: { inline_keyboard: btns }
+          })
+        });
       }
       return new Response("OK");
     }
@@ -3046,7 +3178,7 @@ async function handleAdminBot(request, env) {
           createdAt: Date.now()
         }));
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
-          `✅ 【分销商已创建】\n\n• 名称: ${name}\n• 邀请码: \`${code}\`\n• 推广链接: ${STORE_ORIGIN}/r/${code}\n\n买家打开推广链接或使用邀请码购买，即可关联佣金。`,
+          `✅ 【分销商已创建】\n\n• 名称: ${name}\n• 邀请码: \`${code}\`\n• 推广链接: ${getStoreOrigin(request)}/r/${code}\n\n买家打开推广链接或使用邀请码购买，即可关联佣金。`,
           MAIN_MENU);
       }
       return new Response("OK");
@@ -3077,10 +3209,10 @@ async function handleAdminBot(request, env) {
 
     // 群发流程：收到文本
     if (actionState && actionState.mode === "broadcast") {
-      const result = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
+      const userKeys = await listAllKeys(env, "user_", 10000);
       let sentCount = 0;
-      for (const k of result.keys) {
-        const u = JSON.parse(await env.SUB_STORE.get(k.name));
+      for (const k of userKeys) {
+        const u = JSON.parse(await env.SUB_STORE.get(k));
         if (u.chatId) {
           try {
             await sendTGText(STORE_BOT_TOKEN, u.chatId, `📢 ${text}`);
@@ -3256,16 +3388,14 @@ async function handleAdminBot(request, env) {
       let targetUid = target;
       let userDataStr = await env.SUB_STORE.get(`user_${targetUid}`);
 
-      // 若非 UID 直接命中，尝试按 ChatID 搜索
+      // 若非 UID 直接命中，尝试按 ChatID 搜索（走索引）
       if (!userDataStr) {
-        const users = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
         const targetChatId = parseInt(target.replace("@", ""));
-        for (const k of users.keys) {
-          const u = JSON.parse(await env.SUB_STORE.get(k.name));
-          if (u.chatId && u.chatId === targetChatId) {
-            targetUid = k.name.replace("user_", "");
-            userDataStr = await env.SUB_STORE.get(k.name);
-            break;
+        if (!isNaN(targetChatId)) {
+          const uidByChat = await findUidByChatId(env, targetChatId);
+          if (uidByChat) {
+            targetUid = uidByChat;
+            userDataStr = await env.SUB_STORE.get(`user_${uidByChat}`);
           }
         }
       }
@@ -3317,6 +3447,127 @@ async function handleAdminBot(request, env) {
 }
 
 // ==================== 辅助工具 ====================
+// ===== 通用工具：KV 游标分页遍历（突破单次 1000 key 上限）=====
+// Cloudflare KV list 单次最多返回 1000 个 key，用游标循环取全量
+async function listAllKeys(env, prefix, limit = 10000) {
+  const keys = [];
+  let cursor = undefined;
+  do {
+    const opts = { prefix, limit: 1000 };
+    if (cursor) opts.cursor = cursor;
+    const page = await env.SUB_STORE.list(opts);
+    for (const k of page.keys) {
+      keys.push(k.name);
+      if (keys.length >= limit) return keys;
+    }
+    cursor = page.cursor;
+  } while (cursor);
+  return keys;
+}
+
+// ===== 通用工具：唯一 ID 生成 =====
+// UID 用 8 位随机数字（范围更大），带 KV 存在性重试，杜绝碰撞覆盖
+async function genUniqueUid(env) {
+  for (let i = 0; i < 5; i++) {
+    const uid = Math.floor(10000000 + Math.random() * 89999999).toString(); // 8位
+    if (!(await env.SUB_STORE.get(`user_${uid}`))) return uid;
+  }
+  // 兜底：加时间戳尾数，几乎不可能再碰撞
+  return Math.floor(10000000 + Math.random() * 89999999).toString() + Date.now().toString().slice(-2);
+}
+
+// 生成唯一订单号（ORD- + 时间戳36进制 + 随机），杜绝碰撞
+function genOrderId() {
+  return "ORD-" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
+}
+
+// ===== 通用工具：chatId 反向索引 =====
+// 维护 chatIdx_{chatId} → uid 映射，避免每次全表扫描 user_
+async function indexUserChatId(env, chatId, uid) {
+  if (!chatId || !uid) return;
+  await env.SUB_STORE.put(`chatIdx_${chatId}`, uid);
+}
+
+// 通过 chatId 反查 uid（索引优先，兜底全表扫描兼容旧数据）
+async function findUidByChatId(env, chatId) {
+  const idx = await env.SUB_STORE.get(`chatIdx_${chatId}`);
+  if (idx) return idx;
+  // 兜底扫描（兼容没有索引的旧用户）
+  const keys = await listAllKeys(env, "user_", 5000);
+  for (const k of keys) {
+    try {
+      const u = JSON.parse(await env.SUB_STORE.get(k));
+      if (u.chatId === chatId) {
+        const uid = k.replace("user_", "");
+        await indexUserChatId(env, chatId, uid); // 顺手补索引
+        return uid;
+      }
+    } catch (e) {}
+  }
+  return null;
+}
+
+// 删除用户时同步清理 chatId 索引
+async function unindexUserChatId(env, chatId) {
+  if (chatId) await env.SUB_STORE.delete(`chatIdx_${chatId}`);
+}
+
+// ===== 通用工具：分销关联 =====
+// 记录买家 chatId 的推荐分销商（deep link /start=code 时写入）
+async function setBuyerAffiliate(env, chatId, code) {
+  if (!chatId || !code) return;
+  await env.SUB_STORE.put(`aff_${chatId}`, code, { expirationTtl: 7776000 }); // 90天
+}
+
+// 读取买家关联的分销商（若无返回 null）
+async function getBuyerAffiliate(env, chatId) {
+  try {
+    const code = await env.SUB_STORE.get(`aff_${chatId}`);
+    if (!code) return null;
+    // 根据 code 找分销商
+    const keys = await listAllKeys(env, "reseller_", 2000);
+    for (const k of keys) {
+      try {
+        const r = JSON.parse(await env.SUB_STORE.get(k));
+        if (r.code === code) return { key: k, reseller: r };
+      } catch (e) {}
+    }
+    return null;
+  } catch (e) { return null; }
+}
+
+// 给分销商结算佣金（单价 × 比例）
+async function creditReseller(env, chatId, planPrice) {
+  try {
+    const aff = await getBuyerAffiliate(env, chatId);
+    if (!aff) return;
+    const rate = parseFloat(await env.SUB_STORE.get("comm_rate")) || 10;
+    const priceNum = parseFloat(String(planPrice || "").replace(/[^\d.]/g, ""));
+    if (isNaN(priceNum) || priceNum <= 0) return;
+    const commission = +(priceNum * rate / 100).toFixed(2);
+    if (commission <= 0) return;
+    aff.reseller.commission = (aff.reseller.commission || 0) + commission;
+    aff.reseller.orders = (aff.reseller.orders || 0) + 1;
+    await env.SUB_STORE.put(aff.key, JSON.stringify(aff.reseller));
+  } catch (e) {}
+}
+
+// ===== 通用工具：频控（每 chatId 每动作 N 秒内限一次）=====
+async function rateLimit(env, scope, chatId, seconds = 5) {
+  const key = `rl_${scope}_${chatId}`;
+  const last = await env.SUB_STORE.get(key);
+  const now = Date.now();
+  if (last && (now - parseInt(last)) < seconds * 1000) return false;
+  await env.SUB_STORE.put(key, now.toString(), { expirationTtl: seconds });
+  return true;
+}
+
+// ===== 通用工具：收款码状态 =====
+async function hasPaymentQR(env) {
+  const list = await getPaymentQRs(env);
+  return list.length > 0;
+}
+
 // 读取套餐列表（支持管理员自定义覆盖）
 async function getPlans(env) {
   const plansStr = await env.SUB_STORE.get("plans_config");
@@ -3555,9 +3806,9 @@ async function batchToggleNodes(env, action, nodeIdxList, upIdx) {
 
   // 有变化则清理所有订阅缓存
   if (done > 0) {
-    const caches = await env.SUB_STORE.list({ prefix: "cache_", limit: 1000 });
-    for (const k of caches.keys) {
-      await env.SUB_STORE.delete(k.name);
+    const cacheKeys = await listAllKeys(env, "cache_", 10000);
+    for (const k of cacheKeys) {
+      await env.SUB_STORE.delete(k);
     }
   }
 
@@ -3608,18 +3859,12 @@ async function redeemCoupon(env, code, chatId) {
   const coupon = JSON.parse(couponStr);
   if (coupon.status === "used") return { ok: false, msg: "❌ 该优惠券已被使用" };
 
-  // 检查该 ChatID 是否已有订阅
-  const users = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
-  let existingUid = null;
-  let existingUser = null;
-  for (const k of users.keys) {
-    const u = JSON.parse(await env.SUB_STORE.get(k.name));
-    if (u.chatId === chatId) {
-      existingUid = k.name.replace("user_", "");
-      existingUser = u;
-      break;
-    }
-  }
+  // 折扣实际生效：如 80 折 → 送 80% 天数
+  const actualDays = Math.max(1, Math.round((coupon.days || 30) * (coupon.discountPct || 100) / 100));
+
+  // 检查该 ChatID 是否已有订阅（走索引）
+  const existingUid = await findUidByChatId(env, chatId);
+  let existingUser = existingUid ? JSON.parse(await env.SUB_STORE.get(`user_${existingUid}`)) : null;
 
   const upstream = await getDefaultUpstream(env);
   const now = Date.now();
@@ -3628,23 +3873,23 @@ async function redeemCoupon(env, code, chatId) {
   if (existingUid) {
     finalUid = existingUid;
     const base = Math.max(existingUser.expiry, now);
-    existingUser.expiry = base + (coupon.days * 86400000);
+    existingUser.expiry = base + (actualDays * 86400000);
     existingUser.status = "active";
-    existingUser.plan = coupon.note || `${coupon.days} 天`;
+    existingUser.plan = coupon.note || `${actualDays} 天`;
     await env.SUB_STORE.put(`user_${existingUid}`, JSON.stringify(existingUser));
   } else {
-    const newUid = Math.floor(1000 + Math.random() * 9000).toString();
-    finalUid = newUid;
-    await env.SUB_STORE.put(`user_${newUid}`, JSON.stringify({
+    finalUid = await genUniqueUid(env);
+    await env.SUB_STORE.put(`user_${finalUid}`, JSON.stringify({
       upstreamUrl: upstream,
-      expiry: now + (coupon.days * 86400000),
+      expiry: now + (actualDays * 86400000),
       status: "active",
       brand: DEFAULT_BRAND,
       chatId,
       createdAt: now,
-      plan: coupon.note || `${coupon.days} 天`,
+      plan: coupon.note || `${actualDays} 天`,
       source: "coupon"
     }));
+    await indexUserChatId(env, chatId, finalUid);
   }
 
   coupon.status = "used";
@@ -3652,7 +3897,23 @@ async function redeemCoupon(env, code, chatId) {
   coupon.usedAt = now;
   await env.SUB_STORE.put(key, JSON.stringify(coupon));
 
-  return { ok: true, msg: "🎉 优惠券兑换成功", uid: finalUid, days: coupon.days, plan: coupon.note, discount: coupon.discountPct };
+  // 记录流水（优惠券渠道也计入）
+  await env.SUB_STORE.put(`record_${now}`, JSON.stringify({
+    orderId: code,
+    chatId,
+    plan: coupon.note || `${actualDays} 天`,
+    days: actualDays,
+    price: "",
+    time: now,
+    uid: finalUid,
+    type: existingUid ? "renew" : "new",
+    via: "coupon"
+  }), { expirationTtl: 15552000 });
+
+  // 分销佣金结算
+  await creditReseller(env, chatId, "");
+
+  return { ok: true, msg: "🎉 优惠券兑换成功", uid: finalUid, days: actualDays, plan: coupon.note, discount: coupon.discountPct };
 }
 
 // ===== 卡密系统 =====
@@ -3702,18 +3963,9 @@ async function redeemCard(env, code, chatId) {
   if (card.status === "used") return { ok: false, msg: "❌ 该卡密已被使用" };
   if (card.status === "disabled") return { ok: false, msg: "❌ 该卡密已被禁用" };
 
-  // 检查该 ChatID 是否已有订阅
-  const users = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
-  let existingUid = null;
-  let existingUser = null;
-  for (const k of users.keys) {
-    const u = JSON.parse(await env.SUB_STORE.get(k.name));
-    if (u.chatId === chatId) {
-      existingUid = k.name.replace("user_", "");
-      existingUser = u;
-      break;
-    }
-  }
+  // 检查该 ChatID 是否已有订阅（走索引）
+  const existingUid = await findUidByChatId(env, chatId);
+  let existingUser = existingUid ? JSON.parse(await env.SUB_STORE.get(`user_${existingUid}`)) : null;
 
   const upstream = await getDefaultUpstream(env);
   const now = Date.now();
@@ -3728,10 +3980,9 @@ async function redeemCard(env, code, chatId) {
     existingUser.plan = card.planName;
     await env.SUB_STORE.put(`user_${existingUid}`, JSON.stringify(existingUser));
   } else {
-    // 新购：创建订阅
-    const newUid = Math.floor(1000 + Math.random() * 9000).toString();
-    finalUid = newUid;
-    await env.SUB_STORE.put(`user_${newUid}`, JSON.stringify({
+    // 新购：创建订阅（唯一 UID）
+    finalUid = await genUniqueUid(env);
+    await env.SUB_STORE.put(`user_${finalUid}`, JSON.stringify({
       upstreamUrl: upstream,
       expiry: now + (card.days * 86400000),
       status: "active",
@@ -3741,6 +3992,7 @@ async function redeemCard(env, code, chatId) {
       plan: card.planName,
       source: "card"
     }));
+    await indexUserChatId(env, chatId, finalUid);
   }
 
   // 标记卡密已使用
@@ -3762,40 +4014,43 @@ async function redeemCard(env, code, chatId) {
     via: "card"
   }), { expirationTtl: 15552000 });
 
+  // 分销佣金结算（卡密渠道）
+  await creditReseller(env, chatId, card.price);
+
   return { ok: true, msg: "🎉 兑换成功", uid: finalUid, days: card.days, plan: card.planName };
 }
 
 // 生成系统概览文本（含数据统计）
 async function buildOverview(env) {
-  const userCount = (await env.SUB_STORE.list({ prefix: "user_", limit: 1000 })).keys.length;
-  const pendingCount = (await env.SUB_STORE.list({ prefix: "pending_", limit: 1000 })).keys.length;
+  const userKeys = await listAllKeys(env, "user_", 10000);
+  const pendingKeys = await listAllKeys(env, "pending_", 2000);
+  const userCount = userKeys.length;
+  const pendingCount = pendingKeys.length;
   const pool = await getUpstreamPool(env);
   const activeUp = pool.filter(u => u.status === "active");
   const currentUpstream = activeUp.length > 0 ? activeUp[0].url : DEFAULT_UPSTREAM_URL;
-  const hasQr = await env.SUB_STORE.get("payment_qr_file_id") ? "已托管 🟢" : "未托管 🔴";
+  const hasQr = (await hasPaymentQR(env)) ? "已托管 🟢" : "未托管 🔴";
   const days = await env.SUB_STORE.get("default_days") || DEFAULT_DAYS;
   const price = await env.SUB_STORE.get("price_info") || "未设置";
 
   // 数据统计
-  const users = await env.SUB_STORE.list({ prefix: "user_", limit: 1000 });
   let activeCount = 0, expiredCount = 0, disabledCount = 0;
-  for (const k of users.keys) {
-    const u = JSON.parse(await env.SUB_STORE.get(k.name));
+  for (const k of userKeys) {
+    const u = JSON.parse(await env.SUB_STORE.get(k));
     if (u.status === "disabled") disabledCount++;
     else if (Date.now() > u.expiry) expiredCount++;
     else activeCount++;
   }
 
   // 订单流水统计
-  const records = await env.SUB_STORE.list({ prefix: "record_", limit: 1000 });
-  let recordCount = 0;
-  for (const k of records.keys) { recordCount++; }
+  const recordKeys = await listAllKeys(env, "record_", 5000);
+  let recordCount = recordKeys.length;
 
   // 卡密统计
-  const cards = await env.SUB_STORE.list({ prefix: "card_", limit: 1000 });
+  const cardKeys = await listAllKeys(env, "card_", 10000);
   let cardUnused = 0;
-  for (const k of cards.keys) {
-    const c = JSON.parse(await env.SUB_STORE.get(k.name));
+  for (const k of cardKeys) {
+    const c = JSON.parse(await env.SUB_STORE.get(k));
     if (c.status === "unused") cardUnused++;
   }
 

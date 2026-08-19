@@ -14,8 +14,14 @@ ADMIN_BOT_TOKEN = "YOUR_ADMIN_BOT_TOKEN"
 STORE_BOT_TOKEN = "YOUR_STORE_BOT_TOKEN"
 ADMIN_ID = "YOUR_TELEGRAM_ID"
 DEFAULT_UPSTREAM_URL = "YOUR_UPSTREAM_URL"
-# 可选：Webhook 安全校验密钥（强烈建议设置，防止伪造请求）
+# 对外门户地址（env 优先；未配置时自动用请求域名）
+# STORE_ORIGIN = "https://你的域名.com"
+# 前台 Bot 用户名（去掉 @，用于分销深链/客服链接）
+# STORE_BOT_USERNAME = "你的前台bot用户名"
+# Webhook 安全校验密钥（强烈建议设置，防止伪造请求）
 # WEBHOOK_SECRET = "YOUR_RANDOM_SECRET"
+# /setup-webhooks 鉴权密钥（防恶意重置 webhook；访问需带 ?key=）
+# SETUP_KEY = "YOUR_SETUP_KEY"
 
 # 自定义域名路由（替换为你的域名）
 routes = [

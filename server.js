@@ -133,6 +133,10 @@ async function main() {
         STORE_BOT_TOKEN: process.env.STORE_BOT_TOKEN,
         ADMIN_ID: process.env.ADMIN_ID,
         DEFAULT_UPSTREAM_URL: process.env.DEFAULT_UPSTREAM_URL,
+        DEFAULT_BRAND: process.env.DEFAULT_BRAND,
+        STORE_ORIGIN: process.env.STORE_ORIGIN,
+        STORE_BOT_USERNAME: process.env.STORE_BOT_USERNAME,
+        SETUP_KEY: process.env.SETUP_KEY,
         WEBHOOK_SECRET: process.env.WEBHOOK_SECRET
       };
 
@@ -161,6 +165,57 @@ async function main() {
     console.log(`   ➜ 买家订阅: http://你的域名:${port}/s/{uid}`);
     console.log(`\n⚠️  记得配置 Nginx 反向代理 + HTTPS 才能被 Telegram 访问`);
   });
+
+  // ===== VPS 模式补全 Cron 定时任务 =====
+  // Cloudflare Workers 上由平台 Cron 触发；VPS 上无平台调度，这里用定时器模拟：
+  //  - 每 30 分钟执行一次到期提醒扫描（checkExpiringSubscriptions 本身幂等，不会重复通知）
+  //  - 每天 0 点（UTC+8 早上 8 点即 UTC 0 点）推送每日运营日报
+  try {
+    const env = {
+      SUB_STORE,
+      ADMIN_BOT_TOKEN: process.env.ADMIN_BOT_TOKEN,
+      STORE_BOT_TOKEN: process.env.STORE_BOT_TOKEN,
+      ADMIN_ID: process.env.ADMIN_ID,
+      DEFAULT_UPSTREAM_URL: process.env.DEFAULT_UPSTREAM_URL,
+      DEFAULT_BRAND: process.env.DEFAULT_BRAND,
+      STORE_ORIGIN: process.env.STORE_ORIGIN,
+      STORE_BOT_USERNAME: process.env.STORE_BOT_USERNAME,
+      SETUP_KEY: process.env.SETUP_KEY,
+      WEBHOOK_SECRET: process.env.WEBHOOK_SECRET
+    };
+
+    // 到期提醒扫描：每 30 分钟一次
+    setInterval(async () => {
+      try {
+        await worker.scheduled({ cron: "0 8 * * *" }, env, {});
+        console.log(`[Cron] 到期提醒扫描完成 ${new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`);
+      } catch (e) {
+        console.error("[Cron] 到期提醒扫描失败:", e.message);
+      }
+    }, 30 * 60 * 1000);
+
+    // 每日日报：UTC 0 点（北京时间早 8 点）推送
+    const scheduleDailyReport = () => {
+      const now = new Date();
+      const next = new Date(now);
+      next.setUTCHours(0, 0, 5, 0); // UTC 0 点后 5 秒
+      if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+      const delay = next - now;
+      setTimeout(async () => {
+        try {
+          await worker.scheduled({ cron: "0 0 * * *" }, env, {});
+          console.log(`[Cron] 每日运营日报已推送 ${new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`);
+        } catch (e) {
+          console.error("[Cron] 每日日报推送失败:", e.message);
+        }
+        scheduleDailyReport(); // 循环调度
+      }, delay);
+    };
+    scheduleDailyReport();
+    console.log(`   ➜ 定时任务: 到期提醒每30分钟 / 日报每天UTC 0点`);
+  } catch (e) {
+    console.error("定时任务初始化失败:", e.message);
+  }
 }
 
 main();
