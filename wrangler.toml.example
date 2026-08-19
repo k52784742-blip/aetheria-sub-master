@@ -1,0 +1,33 @@
+# ==================== 配置模板（GitHub 共享版）====================
+# 部署前：复制此文件为 wrangler.toml，填入真实值
+# 敏感信息请使用 wrangler secret put 设置，或填入下方 [vars]
+# 推荐：Token 用 `wrangler secret put ADMIN_BOT_TOKEN` 设置，更安全
+
+name = "aetheria-sub-master"
+main = "worker.js"
+compatibility_date = "2026-08-19"
+workers_dev = false
+
+# 环境变量配置（或用 wrangler secret 替代）
+[vars]
+ADMIN_BOT_TOKEN = "YOUR_ADMIN_BOT_TOKEN"
+STORE_BOT_TOKEN = "YOUR_STORE_BOT_TOKEN"
+ADMIN_ID = "YOUR_TELEGRAM_ID"
+DEFAULT_UPSTREAM_URL = "YOUR_UPSTREAM_URL"
+# 可选：Webhook 安全校验密钥（强烈建议设置，防止伪造请求）
+# WEBHOOK_SECRET = "YOUR_RANDOM_SECRET"
+
+# 自定义域名路由（替换为你的域名）
+routes = [
+  { pattern = "你的域名.com", custom_domain = true }
+]
+
+# 定时触发器（到期自动提醒，每天 UTC 0 点 + 8 点执行）
+[triggers]
+crons = ["0 0 * * *", "0 8 * * *"]
+
+# KV 绑定（替换为你的 KV Namespace ID）
+# 创建：wrangler kv namespace create SUB_STORE
+[[kv_namespaces]]
+binding = "SUB_STORE"
+id = "YOUR_KV_NAMESPACE_ID"

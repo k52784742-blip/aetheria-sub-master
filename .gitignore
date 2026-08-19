@@ -1,0 +1,12 @@
+# ⚠️ 敏感配置 - 绝不提交到 GitHub！
+wrangler.toml
+.dev.vars
+*.log
+
+# 依赖
+node_modules/
+.wrangler/
+
+# 系统文件
+.DS_Store
+Thumbs.db
