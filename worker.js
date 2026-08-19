@@ -409,8 +409,9 @@ async function handleBuyerPortal(uid, request, env) {
     </div>
     <a class="btn" href="clash://install-config?url=${encodeURIComponent(subUrl)}">📥 一键导入 Clash</a>
     <button class="btn btn-copy" onclick="copyUrl()">📋 复制订阅地址</button>
+    <button class="btn btn-copy" onclick="copyYamlUrl()">📄 复制 YAML 订阅</button>
     <button class="btn btn-copy" onclick="copyLegacyUrl()">🔧 复制兼容订阅（旧版客户端）</button>
-    <p style="color:#64748b;font-size:11px;text-align:center;margin:-4px 0 10px 0;">兼容订阅过滤了最新加密协议的节点，FlClash 等旧版客户端导入失败时使用</p>
+    <p style="color:#64748b;font-size:11px;text-align:center;margin:-4px 0 10px 0;">YAML 订阅适用于只支持 YAML 导入的客户端；兼容订阅过滤了最新加密协议的节点</p>
     <details class="qr-box">
       <summary>📱 扫码导入（手机端）</summary>
       <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(subUrl)}" alt="订阅二维码" style="width:100%;max-width:200px;border-radius:12px;margin:12px auto;display:block;">
@@ -451,6 +452,13 @@ async function handleBuyerPortal(uid, request, env) {
       toast.classList.add('show');
       setTimeout(() => toast.classList.remove('show'), 2000);
     }
+    function copyYamlUrl() {
+      const yamlUrl = '${subUrl}' + (${subUrl.includes('?')} ? '&' : '?') + 'yaml=1';
+      navigator.clipboard.writeText(yamlUrl);
+      const toast = document.getElementById('toast');
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2000);
+    }
   </script>
 </body>
 </html>`;
@@ -468,12 +476,16 @@ async function handleBuyerPortal(uid, request, env) {
   // ===== 场景 B: 客户端访问 -> 智能清洗、去重与缓存下发 =====
   // 兼容模式：?legacy=1 时过滤后量子加密(mlkem768x25519plus)节点，
   // 供旧版 Clash Meta / FlClash 内核（<1.19）使用，避免解析报错
+  // YAML 模式：?yaml=1 时返回 Clash YAML 格式（只支持 YAML 导入的客户端）
+  const yamlMode = request.url.includes("yaml=1");
   const legacyMode = request.url.includes("legacy=1");
-  const cacheKey = `cache_${uid}${legacyMode ? "_legacy" : ""}`;
+  const cacheKey = `cache_${uid}${legacyMode ? "_legacy" : ""}${yamlMode ? "_yaml" : ""}`;
   const cachedContent = await env.SUB_STORE.get(cacheKey);
   if (cachedContent) {
     return new Response(cachedContent, {
-      headers: { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" }
+      headers: yamlMode
+        ? { "Content-Type": "application/yaml; charset=utf-8", "Access-Control-Allow-Origin": "*", "Profile-Update-Interval": "24" }
+        : { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" }
     });
   }
 
@@ -565,6 +577,22 @@ async function handleBuyerPortal(uid, request, env) {
   }
 
   const finalOutput = processedNodes.join("\n");
+
+  // ===== YAML 模式：返回 Clash YAML 格式 =====
+  if (yamlMode) {
+    const yamlContent = generateClashYAML(processedNodes, user.brand || DEFAULT_BRAND, uid);
+    await env.SUB_STORE.put(cacheKey, yamlContent, { expirationTtl: 7200 });
+    return new Response(yamlContent, {
+      headers: {
+        "Content-Type": "application/yaml; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        "Profile-Update-Interval": "24",
+        "Subscription-Userinfo": `upload=0; download=0; total=0; expire=${Math.floor(user.expiry / 1000)}`,
+        "Cache-Control": "no-store"
+      }
+    });
+  }
+
   const finalBase64 = btoa(String.fromCharCode(...new TextEncoder().encode(finalOutput)));
 
   await env.SUB_STORE.put(cacheKey, finalBase64, { expirationTtl: 7200 });
@@ -2085,13 +2113,63 @@ async function handleAdminBot(request, env) {
           [{ text: "🔎 搜索用户" }, { text: "➕ 手动开卡" }],
           [{ text: "⏱️ 调整时长" }, { text: "🎯 分配上游" }],
           [{ text: "📝 用户备注" }, { text: "💬 私信用户" }],
-          [{ text: "📤 导出名单" }],
+          [{ text: "�️ 删除用户" }, { text: "📤 导出名单" }],
           [{ text: "🏠 返回主菜单" }]
         ],
         resize_keyboard: true,
         persistent: true
       };
       await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "👥 【用户管理】\n请选择操作：", userMenu);
+      return new Response("OK");
+    }
+
+    // 删除用户（第一步：输入 UID）
+    if (text === "🗑️ 删除用户") {
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "del_uid", chatId }));
+      const replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: "🗑️ 【删除用户】\n请输入要删除的用户 UID：\n\n（删除后 24 小时内可恢复）",
+          reply_markup: replyMarkup
+        })
+      });
+      return new Response("OK");
+    }
+
+    // 删除用户流程：输入 UID → 确认
+    if (actionState && actionState.mode === "del_uid" && /^\d+$/.test(text)) {
+      const targetUid = text.trim();
+      const userDataStr = await env.SUB_STORE.get(`user_${targetUid}`);
+      await env.SUB_STORE.delete("admin_action_state");
+      if (!userDataStr) {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `❌ 用户 UID:${targetUid} 不存在`, MAIN_MENU);
+      } else {
+        const u = JSON.parse(userDataStr);
+        // 保存删除前的数据，供撤销恢复
+        const delId = Date.now();
+        await env.SUB_STORE.put(`revoke_del_${delId}`, JSON.stringify({
+          uid: targetUid,
+          data: JSON.parse(userDataStr),
+          time: Date.now()
+        }), { expirationTtl: 86400 });
+        await env.SUB_STORE.delete(`user_${targetUid}`);
+        await env.SUB_STORE.delete(`cache_${targetUid}`);
+        await unindexUserChatId(env, u.chatId);
+        await logAction(env, "删除用户", `UID:${targetUid} ChatID:${u.chatId || "-"}`);
+        const replyMarkup = { inline_keyboard: [[{ text: "↩️ 恢复用户", callback_data: `undel_${targetUid}` }]] };
+        await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: `🗑️ 用户 [${targetUid}] 已删除！\n\n如需恢复请点击下方按钮：`,
+            reply_markup: replyMarkup
+          })
+        });
+      }
       return new Response("OK");
     }
 
@@ -3995,6 +4073,163 @@ async function fetchUpstreamNodes(env, upstreamUrl) {
 async function isMergeMode(env) {
   const v = await env.SUB_STORE.get("merge_mode");
   return v === "on";
+}
+
+// ===== 生成 Clash YAML 订阅（供只支持 YAML 导入的客户端使用）=====
+// 输入: 清洗后的节点行数组（vless:// / hysteria2:// / vmess:// 等）
+// 输出: Clash Meta 兼容的 YAML 文本
+function generateClashYAML(nodes, brand, uid) {
+  const proxies = [];
+  const seen = new Set();
+
+  for (const line of nodes) {
+    const l = line.trim();
+    if (!l || !l.includes("://")) continue;
+
+    // 提取名称（# 后）
+    let name = "Node";
+    let urlPart = l;
+    const hashIdx = l.indexOf("#");
+    if (hashIdx >= 0) {
+      urlPart = l.slice(0, hashIdx);
+      try { name = decodeURIComponent(l.slice(hashIdx + 1)); } catch (e) { name = l.slice(hashIdx + 1); }
+    }
+
+    try {
+      const u = new URL(urlPart);
+
+      if (urlPart.startsWith("vless://")) {
+        const params = u.searchParams;
+        const enc = params.get("encryption") || "none";
+        // 后量子加密（mlkem768x25519plus）老内核不支持，跳过
+        if (enc && enc.includes("mlkem768x25519plus")) continue;
+        const proxy = {
+          name,
+          type: "vless",
+          server: u.hostname,
+          port: u.port ? parseInt(u.port) : 443,
+          uuid: u.username,
+          network: params.get("type") || "tcp",
+          "tls": params.get("security") === "reality" ? true : (params.get("security") === "tls" ? true : false),
+          "servername": params.get("sni") || u.hostname,
+          "client-fingerprint": params.get("fp") || "chrome",
+          "reality-opts": {
+            "public-key": params.get("pbk") || "",
+            "short-id": params.get("sid") || ""
+          }
+        };
+        if (params.get("flow")) proxy["flow"] = params.get("flow");
+        if (params.get("headerType") && params.get("headerType") !== "none") proxy["header-type"] = params.get("headerType");
+        if (params.get("path")) {
+          proxy["ws-opts"] = { path: params.get("path") };
+          if (params.get("host")) proxy["ws-opts"]["headers"] = { Host: params.get("host") };
+        }
+        proxies.push(proxy);
+      }
+      else if (urlPart.startsWith("hysteria2://")) {
+        const params = u.searchParams;
+        const proxy = {
+          name,
+          type: "hysteria2",
+          server: u.hostname,
+          port: u.port ? parseInt(u.port) : 443,
+          password: u.username,
+          "skip-cert-verify": params.get("insecure") === "1" ? true : false
+        };
+        if (params.get("sni")) proxy["sni"] = params.get("sni");
+        if (params.get("obfs")) {
+          proxy["obfs"] = params.get("obfs");
+          if (params.get("obfs-password")) proxy["obfs-password"] = decodeURIComponent(params.get("obfs-password"));
+        }
+        proxies.push(proxy);
+      }
+      else if (urlPart.startsWith("vmess://")) {
+        // vmess:// 可能是 base64 编码的 JSON
+        try {
+          let jsonStr = u.username;
+          // 若是 base64，解码
+          if (jsonStr && !jsonStr.startsWith("{")) {
+            try {
+              const pad = 4 - (jsonStr.length % 4);
+              if (pad < 4) jsonStr += "=".repeat(pad);
+              jsonStr = new TextDecoder().decode(Uint8Array.from(atob(jsonStr), c => c.charCodeAt(0)));
+            } catch (e) {}
+          }
+          const vm = JSON.parse(jsonStr);
+          const proxy = {
+            name,
+            type: "vmess",
+            server: vm.add || u.hostname,
+            port: vm.port ? parseInt(vm.port) : 443,
+            uuid: vm.id,
+            alterId: vm.aid ? parseInt(vm.aid) : 0,
+            cipher: vm.scy || "auto",
+            network: vm.net || "tcp"
+          };
+          if (vm.tls) proxy["tls"] = vm.tls === "tls" ? true : vm.tls;
+          if (vm.sni) proxy["servername"] = vm.sni;
+          if (vm.host && proxy.network === "ws") proxy["ws-opts"] = { headers: { Host: vm.host } };
+          if (vm.path && proxy.network === "ws") {
+            proxy["ws-opts"] = proxy["ws-opts"] || {};
+            proxy["ws-opts"]["path"] = vm.path;
+          }
+          proxies.push(proxy);
+        } catch (e) { /* 解析失败跳过 */ }
+      }
+    } catch (e) { /* 单个节点解析失败跳过 */ }
+  }
+
+  // 组名
+  const groupName = `${brand || "Maybe"} 节点 [UID:${uid}]`;
+
+  // 生成 YAML
+  let yaml = `# ${groupName}\n# 由 AETHERIA 自动生成 (${new Date().toISOString()})\n\n`;
+  yaml += `mixed-port: 7890\n`;
+  yaml += `allow-lan: false\n`;
+  yaml += `mode: rule\n`;
+  yaml += `log-level: info\n\n`;
+  yaml += `proxies:\n`;
+  for (const p of proxies) {
+    yaml += `  - name: ${JSON.stringify(p.name)}\n`;
+    for (const [k, v] of Object.entries(p)) {
+      if (k === "name") continue;
+      if (typeof v === "object" && v !== null) {
+        yaml += `    ${k}:\n`;
+        for (const [k2, v2] of Object.entries(v)) {
+          if (typeof v2 === "object" && v2 !== null) {
+            yaml += `      ${k2}:\n`;
+            for (const [k3, v3] of Object.entries(v2)) {
+              yaml += `        ${k3}: ${JSON.stringify(v3)}\n`;
+            }
+          } else {
+            yaml += `      ${k2}: ${JSON.stringify(v2)}\n`;
+          }
+        }
+      } else {
+        yaml += `    ${k}: ${JSON.stringify(v)}\n`;
+      }
+    }
+    yaml += "\n";
+  }
+  yaml += `proxy-groups:\n`;
+  yaml += `  - name: "🚀 节点选择"\n`;
+  yaml += `    type: select\n`;
+  yaml += `    proxies:\n`;
+  for (const p of proxies) {
+    yaml += `      - ${JSON.stringify(p.name)}\n`;
+  }
+  yaml += `  - name: "♻️ 自动选择"\n`;
+  yaml += `    type: url-test\n`;
+  yaml += `    url: "http://www.gstatic.com/generate_204"\n`;
+  yaml += `    interval: 300\n`;
+  yaml += `    proxies:\n`;
+  for (const p of proxies) {
+    yaml += `      - ${JSON.stringify(p.name)}\n`;
+  }
+  yaml += `rules:\n`;
+  yaml += `  - MATCH,🚀 节点选择\n`;
+
+  return yaml;
 }
 
 // 合并拉取所有活跃上游的节点（去重）
