@@ -230,6 +230,34 @@ async function handleBuyerPortal(uid, request, env) {
       else if (serviceContact.startsWith("http")) serviceLink = serviceContact;
     }
 
+    // 公告展示
+    const notice = await env.SUB_STORE.get("notice_content") || "";
+
+    // 订阅开通时间与累计信息
+    const createdAt = user.createdAt || user.expiry - (30 * 86400000);
+    const createdDate = new Date(createdAt).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
+    const sourceDesc = user.source === "card" ? "卡密兑换" : (user.source === "coupon" ? "优惠券" : "官方购买");
+    const totalPlanDays = user.planDays || (user.plan ? parseInt(String(user.plan).match(/\d+/)) || 30 : 30);
+
+    // 有效期进度条（基于已用/总时长比例）
+    const totalMs = Math.max(user.expiry - createdAt, 86400000);
+    const usedMs = Date.now() - createdAt;
+    const progressPct = Math.max(0, Math.min(100, Math.round((1 - (user.expiry - Date.now()) / totalMs) * 100)));
+
+    // 公告横幅（未过期时显示）
+    const noticeBanner = (notice && !disabled && !expired) ? `
+    <div style="background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.2);border-radius:12px;padding:12px;margin-bottom:16px;text-align:left;">
+      <div style="color:#38bdf8;font-size:12px;font-weight:700;margin-bottom:4px;">📢 公告</div>
+      <div style="color:#94a3b8;font-size:13px;line-height:1.6;">${notice}</div>
+    </div>` : "";
+
+    // 即将到期横幅（7天内）
+    const expiringBanner = (!disabled && !expired && remainDays <= 7 && remainDays > 0) ? `
+    <div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);border-radius:12px;padding:12px;margin-bottom:16px;text-align:center;">
+      <div style="color:#fbbf24;font-size:14px;font-weight:700;">⏰ 订阅将于 ${remainDays} 天后到期</div>
+      <div style="color:#94a3b8;font-size:12px;margin-top:4px;">请及时续费以免影响使用</div>
+    </div>` : "";
+
     const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -263,6 +291,10 @@ async function handleBuyerPortal(uid, request, env) {
     .btn-copy:hover { background: rgba(148, 163, 184, 0.25); }
     .qr-box { background: rgba(15, 23, 42, 0.7); border: 1px solid rgba(148, 163, 184, 0.1); border-radius: 12px; padding: 12px; margin-bottom: 10px; }
     .qr-box summary { color: #38bdf8; font-size: 14px; font-weight: 600; cursor: pointer; }
+    .progress-box { background: rgba(15, 23, 42, 0.7); border: 1px solid rgba(148, 163, 184, 0.1); border-radius: 12px; padding: 14px; margin-bottom: 16px; }
+    .progress-label { display: flex; justify-content: space-between; color: #94a3b8; font-size: 12px; margin-bottom: 8px; }
+    .progress-bar { background: rgba(148, 163, 184, 0.15); border-radius: 20px; height: 8px; overflow: hidden; }
+    .progress-fill { height: 100%; border-radius: 20px; transition: width 0.5s ease; }
     .footer { text-align: center; color: #475569; font-size: 12px; margin-top: 16px; }
     .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(100px); background: #0284c7; color: #fff; padding: 10px 20px; border-radius: 10px; font-size: 14px; transition: all 0.3s; opacity: 0; }
     .toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
@@ -272,11 +304,13 @@ async function handleBuyerPortal(uid, request, env) {
   <div class="card">
     <span class="badge ${disabled ? 'badge-danger' : (expired ? 'badge-warn' : 'badge-active')}">${statusText}</span>
     <h2>🛡️ ${DEFAULT_BRAND} 专属节点</h2>
-    <div class="subtitle">订阅编号 · UID-${uid}</div>
+    <div class="subtitle">订阅编号 · UID-${uid} · ${sourceDesc}</div>
+    ${noticeBanner}
+    ${expiringBanner}
     <div class="grid">
       <div class="stat">
         <div class="stat-label">📦 套餐</div>
-        <div class="stat-value">${plan}${price ? ` · ${price}` : ""}</div>
+        <div class="stat-value">${plan}</div>
       </div>
       <div class="stat">
         <div class="stat-label">⏰ 到期时间</div>
@@ -287,11 +321,20 @@ async function handleBuyerPortal(uid, request, env) {
         <div class="stat-value ${disabled ? 'red' : (expired ? 'yellow' : 'green')}">${remainDays > 0 ? remainDays + " 天" : (disabled ? "已暂停" : "已过期")}</div>
       </div>
       <div class="stat">
-        <div class="stat-label">🌐 状态</div>
-        <div class="stat-value ${disabled ? 'red' : (expired ? 'yellow' : 'green')}">${statusText}</div>
+        <div class="stat-label">📅 开通日期</div>
+        <div class="stat-value">${createdDate}</div>
       </div>
     </div>
     ${disabled ? "" : `
+    <div class="progress-box">
+      <div class="progress-label">
+        <span>📈 有效期使用进度</span>
+        <span style="color:${progressPct > 90 ? '#f87171' : (progressPct > 70 ? '#fbbf24' : '#4ade80')}">${progressPct}%</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" style="width:${progressPct}%;background:${progressPct > 90 ? '#f87171' : (progressPct > 70 ? '#fbbf24' : '#4ade80')};"></div>
+      </div>
+    </div>
     <a class="btn" href="clash://install-config?url=${encodeURIComponent(subUrl)}">📥 一键导入 Clash</a>
     <button class="btn btn-copy" onclick="copyUrl()">📋 复制订阅地址</button>
     <details class="qr-box">
@@ -306,14 +349,18 @@ async function handleBuyerPortal(uid, request, env) {
         <p><b style="color:#38bdf8;">2. 其他客户端：</b>复制订阅地址，在客户端「添加订阅」中粘贴</p>
         <p><b style="color:#38bdf8;">3. 手机扫码：</b>展开「扫码导入」扫二维码</p>
         <p><b style="color:#38bdf8;">4. 到期续费：</b>到期前自动提醒，点续费按钮即可</p>
+        <p><b style="color:#38bdf8;">5. 卡密/优惠券：</b>在 @zzgmdybot 中兑换</p>
       </div>
     </details>
     `}
     ${expired && !disabled ? `
     <a class="btn btn-renew" href="${renewUrl}">🔄 立即续费</a>
     ` : ""}
+    ${!disabled && !expired ? `
+    <a class="btn btn-renew" href="${renewUrl}" style="background:rgba(56,189,248,0.15);">🔄 提前续费</a>
+    ` : ""}
     <a class="btn btn-secondary" href="${serviceLink}">📩 联系客服</a>
-    <div class="footer">AETHERIA Power · ${DEFAULT_BRAND} Cloud</div>
+    <div class="footer">AETHERIA Power · ${DEFAULT_BRAND} Cloud · Powered by Cloudflare</div>
   </div>
   <div class="toast" id="toast">✅ 订阅地址已复制</div>
   <script>
