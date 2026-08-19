@@ -409,6 +409,8 @@ async function handleBuyerPortal(uid, request, env) {
     </div>
     <a class="btn" href="clash://install-config?url=${encodeURIComponent(subUrl)}">📥 一键导入 Clash</a>
     <button class="btn btn-copy" onclick="copyUrl()">📋 复制订阅地址</button>
+    <button class="btn btn-copy" onclick="copyLegacyUrl()">🔧 复制兼容订阅（旧版客户端）</button>
+    <p style="color:#64748b;font-size:11px;text-align:center;margin:-4px 0 10px 0;">兼容订阅过滤了最新加密协议的节点，FlClash 等旧版客户端导入失败时使用</p>
     <details class="qr-box">
       <summary>📱 扫码导入（手机端）</summary>
       <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(subUrl)}" alt="订阅二维码" style="width:100%;max-width:200px;border-radius:12px;margin:12px auto;display:block;">
@@ -442,6 +444,13 @@ async function handleBuyerPortal(uid, request, env) {
       toast.classList.add('show');
       setTimeout(() => toast.classList.remove('show'), 2000);
     }
+    function copyLegacyUrl() {
+      const legacyUrl = '${subUrl}' + (${subUrl.includes('?')} ? '&' : '?') + 'legacy=1';
+      navigator.clipboard.writeText(legacyUrl);
+      const toast = document.getElementById('toast');
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2000);
+    }
   </script>
 </body>
 </html>`;
@@ -457,7 +466,10 @@ async function handleBuyerPortal(uid, request, env) {
   }
 
   // ===== 场景 B: 客户端访问 -> 智能清洗、去重与缓存下发 =====
-  const cacheKey = `cache_${uid}`;
+  // 兼容模式：?legacy=1 时过滤后量子加密(mlkem768x25519plus)节点，
+  // 供旧版 Clash Meta / FlClash 内核（<1.19）使用，避免解析报错
+  const legacyMode = request.url.includes("legacy=1");
+  const cacheKey = `cache_${uid}${legacyMode ? "_legacy" : ""}`;
   const cachedContent = await env.SUB_STORE.get(cacheKey);
   if (cachedContent) {
     return new Response(cachedContent, {
@@ -514,6 +526,9 @@ async function handleBuyerPortal(uid, request, env) {
     line = line.trim();
     if (!line || !line.includes("://")) continue;
 
+    // 兼容模式：跳过后量子加密节点（旧内核不支持 mlkem768x25519plus）
+    if (legacyMode && line.includes("mlkem768x25519plus")) continue;
+
     const parts = line.split("#");
     const basePart = parts[0];
     let origName = parts[1] ? decodeURIComponent(parts[1]) : "Node";
@@ -542,7 +557,11 @@ async function handleBuyerPortal(uid, request, env) {
 
     const idx = counters[region]++;
     const formattedName = `${user.brand || DEFAULT_BRAND} · ${region} 0${idx} [UID:${uid}]`;
-    processedNodes.push(`${basePart}#${encodeURIComponent(formattedName)}`);
+    // ⚠️ 兼容性关键：Clash Meta / FlClash 等对 # 后节点名只做一次 URL 解码，
+    // 若用 encodeURIComponent 全量编码（中文/·/[] 变 %XX），会导致解析失败/名称乱码。
+    // 正确做法：仅对空格做 %20 转义（最通用），其余保留 UTF-8 原文。
+    const encodedName = formattedName.split(" ").join("%20");
+    processedNodes.push(`${basePart}#${encodedName}`);
   }
 
   const finalOutput = processedNodes.join("\n");
@@ -550,8 +569,18 @@ async function handleBuyerPortal(uid, request, env) {
 
   await env.SUB_STORE.put(cacheKey, finalBase64, { expirationTtl: 7200 });
 
+  // 标准订阅响应头（Clash/FlClash 等客户端会读取）：
+  // - Subscription-Userinfo: 到期时间/流量（Clash 支持显示）
+  // - Profile-Update-Interval: 自动更新间隔（小时）
+  const userinfo = `upload=0; download=0; total=0; expire=${Math.floor(user.expiry / 1000)}`;
   return new Response(finalBase64, {
-    headers: { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" }
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Profile-Update-Interval": "24",
+      "Subscription-Userinfo": userinfo,
+      "Cache-Control": "no-store"
+    }
   });
 }
 
