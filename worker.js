@@ -209,14 +209,11 @@ async function handleWebhookSetup(request, env) {
 
     // ===== 注册左侧命令菜单（点"/"即可看到，一键触发，无需手输命令）=====
     // 前台售卖 Bot 命令菜单（买家可见）
+    // ⚠️ 只保留 /start 与 /buy：其余功能（查询/卡密/优惠券/FAQ/客服）已在
+    //    底部键盘菜单（storeMenu）中，避免两处重复入口造成困惑。
     const storeCommands = [
       { command: "start", description: "🏠 开始 / 公告" },
-      { command: "buy", description: "🛒 购买套餐" },
-      { command: "query", description: "🔍 查询订阅" },
-      { command: "card", description: "🎫 兑换卡密" },
-      { command: "coupon", description: "🎁 优惠券兑换" },
-      { command: "faq", description: "❓ 常见问题" },
-      { command: "service", description: "📞 联系客服" }
+      { command: "buy", description: "🛒 购买套餐" }
     ];
     // 管理 Bot 命令菜单（仅管理员可见）
     const adminCommands = [
