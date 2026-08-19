@@ -619,7 +619,8 @@ async function handleRenewPage(uid, request, env) {
       if (!lastNotified || (now - parseInt(lastNotified)) > 30 * 60 * 1000) {
         const adminMarkup = {
           inline_keyboard: [
-            [{ text: "🟢 确认续费 · 开通", callback_data: `approve_${chatId}` }]
+            [{ text: "🟢 确认续费 · 开通", callback_data: `approve_renew_${uid}_${chatId}` }],
+            [{ text: "❌ 拒绝续费", callback_data: `reject_renew_${uid}_${chatId}` }]
           ]
         };
         await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
@@ -627,7 +628,7 @@ async function handleRenewPage(uid, request, env) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             chat_id: ADMIN_ID,
-            text: `🔄 【续费请求】\n• 用户 UID: ${uid}\n• ChatID: \`${chatId}\`\n• 剩余: ${Math.max(0, Math.ceil(remainDays))} 天\n• 请求续费: ${days} 天\n\n请审核后点击按钮开通：`,
+            text: `🔄 【续费请求】\n• 用户 UID: ${uid}\n• ChatID: \`${chatId}\`\n• 剩余: ${Math.max(0, Math.ceil(remainDays))} 天\n• 请求续费: ${days} 天\n\n请审核后点击按钮：`,
             reply_markup: adminMarkup,
             parse_mode: "Markdown"
           })
@@ -1292,10 +1293,104 @@ async function handleAdminBot(request, env) {
       let replyText = "";
       let replyMarkup = null;
 
+      // ===== 续费专用回调：确认续费 / 拒绝续费 =====
+      // 格式：approve_renew_{uid}_{chatId} / reject_renew_{uid}_{chatId}
+      if (data.startsWith("approve_renew_")) {
+        const rparts = data.replace("approve_renew_", "").split("_");
+        const rUid = rparts[0];
+        const rChatId = rparts.slice(1).join("_");
+        const rUserStr = await env.SUB_STORE.get(`user_${rUid}`);
+        if (!rUserStr) {
+          replyText = `❌ 用户 UID:${rUid} 不存在`;
+        } else {
+          const ru = JSON.parse(rUserStr);
+          const days = parseInt(await env.SUB_STORE.get("default_days")) || DEFAULT_DAYS;
+          const prevExpiry = ru.expiry;
+          const base = Math.max(ru.expiry, Date.now());
+          ru.expiry = base + (days * 86400000);
+          ru.status = "active";
+          await env.SUB_STORE.put(`user_${rUid}`, JSON.stringify(ru));
+
+          const rOrderId = "RENEW-" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+          // 记流水
+          const rKey = `record_${Date.now()}`;
+          await env.SUB_STORE.put(rKey, JSON.stringify({
+            orderId: rOrderId,
+            chatId: ru.chatId || rChatId,
+            plan: `${days} 天续费`,
+            days,
+            price: await env.SUB_STORE.get("price_info") || "",
+            time: Date.now(),
+            uid: rUid,
+            type: "renew"
+          }), { expirationTtl: 15552000 });
+
+          // 保存撤销记录（同一订单号，撤销时删对应流水）
+          await env.SUB_STORE.put(`revoke_${cb.message.message_id}`, JSON.stringify({
+            uid: rUid,
+            chatId: ru.chatId || rChatId,
+            prevExpiry,
+            isNew: false,
+            days,
+            orderId: rOrderId,
+            time: Date.now()
+          }), { expirationTtl: 86400 });
+
+          await logAction(env, "确认续费", `UID:${rUid} +${days}天 (续费请求)`);
+
+          // 通知买家
+          try {
+            const origin = new URL(request.url).origin;
+            await sendTGText(STORE_BOT_TOKEN, ru.chatId || rChatId,
+              `🎉 【续费成功】\n您的续费请求已通过！\n\n• 时长: ${days} 天\n• 到期: ${new Date(ru.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n\n🔗 ${origin}/s/${rUid}`);
+          } catch (e) {}
+
+          replyAlert = `✅ 续费已确认！UID:${rUid} (+${days}天)`;
+
+          // 编辑管理端消息：标记已处理 + 撤销按钮（不设 replyText，避免通用逻辑二次编辑）
+          try {
+            const markup = {
+              inline_keyboard: [
+                [{ text: "↩️ 撤销此操作", callback_data: `revoke_${cb.message.message_id}` }]
+              ]
+            };
+            await editTGMessage(ADMIN_BOT_TOKEN, cb.message.chat.id, cb.message.message_id,
+              `✅ 【续费已处理】\nUID: ${rUid}\n时长: +${days} 天\n\n如需撤销请点击下方按钮。`,
+              markup);
+          } catch (e) {}
+        }
+      }
+
+      // 拒绝续费
+      else if (data.startsWith("reject_renew_")) {
+        const rparts = data.replace("reject_renew_", "").split("_");
+        const rUid = rparts[0];
+        const rChatId = rparts.slice(1).join("_");
+        const rUserStr = await env.SUB_STORE.get(`user_${rUid}`);
+        if (!rUserStr) {
+          replyText = `❌ 用户 UID:${rUid} 不存在`;
+        } else {
+          const ru = JSON.parse(rUserStr);
+          // 通知买家续费被拒绝
+          try {
+            await sendTGText(STORE_BOT_TOKEN, ru.chatId || rChatId,
+              `❌ 【续费被拒绝】\n很抱歉，您的续费请求被管理员拒绝了。\n\n如有疑问请联系客服。`);
+          } catch (e) {}
+          await logAction(env, "拒绝续费", `UID:${rUid} ChatID:${ru.chatId || rChatId}`);
+          replyAlert = `❌ 已拒绝用户 [${rUid}] 的续费请求，已通知买家。`;
+          // 编辑管理端消息标记已处理
+          try {
+            await editTGMessage(ADMIN_BOT_TOKEN, cb.message.chat.id, cb.message.message_id,
+              `❌ 【续费已拒绝】\nUID: ${rUid} 的续费请求已被拒绝。\n\n已通知买家。`,
+              null);
+          } catch (e) {}
+        }
+      }
+
       // 确认到账 → 开通（区分新购/续费）
       // 幂等保护：每个凭证通知消息只处理一次，防止重复点击重复加天数
       // 回调格式：approve_{chatId}_{orderId}（orderId 可选，兼容旧按钮）
-      if (data.startsWith("approve_")) {
+      else if (data.startsWith("approve_")) {
         const parts = data.split("_");
         const targetChatId = parts[1];
         const approveOrderId = parts.slice(2).join("_") || null; // 订单号可能含特殊字符，用 join 保留
