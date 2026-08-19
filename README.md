@@ -832,7 +832,9 @@ A: `git pull` 拉取最新 → `wrangler deploy` 重新部署。
 ## 📦 文件结构
 
 ```
-├── worker.js              主程序（全部逻辑）
+├── worker.js              主程序（全部逻辑，Cloudflare Workers 版）
+├── server.js              VPS 服务器运行适配器（Node.js 版）
+├── package.json           Node.js 项目配置（VPS 版用）
 ├── wrangler.toml          本地部署配置（敏感，已 gitignore）
 ├── wrangler.toml.example  配置模板（GitHub 共享）
 ├── .dev.vars.example      本地开发变量模板
@@ -840,6 +842,10 @@ A: `git pull` 拉取最新 → `wrangler deploy` 重新部署。
 ├── README.md              本文档
 └── LICENSE                MIT 协议
 ```
+
+**双模式说明**：
+- **免费模式**（Cloudflare Workers）：只用 `worker.js`
+- **VPS 模式**（自建服务器）：用 `server.js` + `worker.js` + `package.json`
 
 ---
 
