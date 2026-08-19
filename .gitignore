@@ -1,7 +1,11 @@
 # ⚠️ 敏感配置 - 绝不提交到 GitHub！
 wrangler.toml
 .dev.vars
+.env
+.env.*
+!.env.example
 *.log
+.kv-data.json
 
 # 依赖
 node_modules/

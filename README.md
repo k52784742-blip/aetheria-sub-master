@@ -475,43 +475,53 @@ git clone https://github.com/k52784742-blip/aetheria-sub-master.git
 cd aetheria-sub-master
 ```
 
-#### 4. 配置环境变量
+#### 4. 配置环境变量（关键！）
+
+VPS 模式用 `.env` 文件配置（不用 wrangler.toml）：
 
 ```bash
-# 复制配置模板
-cp wrangler.toml.example wrangler.toml
+# 复制环境变量模板
+cp .env.example .env
 
 # 编辑配置（用 nano 编辑器）
-nano wrangler.toml
+nano .env
 ```
 
-把里面的值改成你的真实信息，然后 `Ctrl+X` → `Y` → 回车 保存。
+把里面的值改成你的真实信息：
+
+```env
+ADMIN_BOT_TOKEN = "你的管理Bot Token"      # 管理 Bot 的 Token
+STORE_BOT_TOKEN = "你的前台Bot Token"      # 前台 Bot 的 Token
+ADMIN_ID = "你的Telegram数字ID"            # 你的数字 ID
+DEFAULT_UPSTREAM_URL = "你的上游链接"      # 默认订阅源
+```
+
+> 修改方法：`nano` 编辑器里用方向键移动光标，改完按 `Ctrl+X` → 按 `Y` → 按回车 保存退出。
 
 #### 5. 安装 Node 运行依赖
 
-项目纯 JS 无第三方依赖，但为了用 `node` 直接运行 Worker，需要一个小工具：
-
 ```bash
-npm init -y
-npm install wrangler
+npm install
 ```
 
-#### 6. 创建 KV 存储（本地模拟）
+> 如果提示缺 `package-lock.json` 之类的，先 `npm install -g wrangler` 再试。
 
-```bash
-# 初始化本地 KV
-npx wrangler dev --local
-# 看到 "Ready" 后按 Ctrl+C 停止
-```
+#### 6. 启动服务（先测试）
 
-#### 7. 启动服务
-
-**方式 A：直接运行（测试用）**
 ```bash
 node server.js
 ```
 
-**方式 B：使用 PM2 常驻运行（推荐）**
+看到以下输出就是成功：
+```
+🚀 AETHERIA 服务已启动
+   ➜ 本地地址: http://localhost:8787
+```
+
+按 `Ctrl+C` 停止，继续下一步配置常驻运行。
+
+#### 7. 使用 PM2 常驻运行（推荐）
+
 ```bash
 # 安装 PM2
 npm install -g pm2
@@ -884,6 +894,7 @@ A: `git pull` 拉取最新 → `wrangler deploy` 重新部署。
 ├── worker.js              主程序（全部逻辑，Cloudflare Workers 版）
 ├── server.js              VPS 服务器运行适配器（Node.js 版）
 ├── package.json           Node.js 项目配置（VPS 版用）
+├── .env.example           VPS 环境变量模板
 ├── wrangler.toml          本地部署配置（敏感，已 gitignore）
 ├── wrangler.toml.example  配置模板（GitHub 共享）
 ├── .dev.vars.example      本地开发变量模板
@@ -894,7 +905,7 @@ A: `git pull` 拉取最新 → `wrangler deploy` 重新部署。
 
 **双模式说明**：
 - **免费模式**（Cloudflare Workers）：只用 `worker.js`
-- **VPS 模式**（自建服务器）：用 `server.js` + `worker.js` + `package.json`
+- **VPS 模式**（自建服务器）：用 `server.js` + `worker.js` + `package.json` + `.env`
 
 ---
 
