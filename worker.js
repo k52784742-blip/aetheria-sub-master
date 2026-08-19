@@ -1547,6 +1547,68 @@ async function handleAdminBot(request, env) {
         }
       }
 
+      // 分配上游：从 /check 面板进入，显示上游池选择
+      else if (data.startsWith("assign_")) {
+        const targetUid = data.replace("assign_", "");
+        const userDataStr = await env.SUB_STORE.get(`user_${targetUid}`);
+        if (!userDataStr) {
+          replyText = `❌ 用户 UID:${targetUid} 不存在`;
+        } else {
+          const u = JSON.parse(userDataStr);
+          await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "assign_up", uid: targetUid, chatId }));
+          const pool = await getUpstreamPool(env);
+          const btns = [];
+          pool.forEach((up, i) => {
+            if (up.status !== "active") return;
+            btns.push([{ text: `${up.isDefault ? "⭐" : ""} ${up.note || "上游" + (i + 1)}`, callback_data: `assignup_${i}` }]);
+          });
+          btns.push([{ text: "↩️ 恢复自动分配", callback_data: `assignup_auto` }]);
+          btns.push([{ text: "❌ 取消", callback_data: "cancel_action" }]);
+          const currentUp = u.upstreamUrl ? "（已指定）" : "（自动分配）";
+          replyText = `🎯 【分配上游】\n用户 UID: ${targetUid} ${currentUp}\n\n请选择要分配的上游：`;
+          replyMarkup = { inline_keyboard: btns };
+        }
+      }
+
+      // 分配上游：选择上游
+      else if (data.startsWith("assignup_")) {
+        const arg = data.replace("assignup_", "");
+        const stateStr = await env.SUB_STORE.get("admin_action_state");
+        let targetUid = null;
+        try { if (stateStr) targetUid = JSON.parse(stateStr).uid; } catch (e) {}
+        if (!targetUid) {
+          replyText = "❌ 会话已过期，请重新选择用户";
+        } else {
+          const userDataStr = await env.SUB_STORE.get(`user_${targetUid}`);
+          if (!userDataStr) {
+            replyText = `❌ 用户 UID:${targetUid} 不存在`;
+          } else {
+            const u = JSON.parse(userDataStr);
+            if (arg === "auto") {
+              delete u.upstreamUrl;
+              await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
+              await env.SUB_STORE.delete(`cache_${targetUid}`);
+              await env.SUB_STORE.delete("admin_action_state");
+              replyText = `✅ 用户 [${targetUid}] 已恢复自动分配上游！`;
+            } else {
+              const upIdx = parseInt(arg);
+              const pool = await getUpstreamPool(env);
+              if (isNaN(upIdx) || upIdx < 0 || upIdx >= pool.length) {
+                replyText = "❌ 上游序号无效";
+              } else {
+                const up = pool[upIdx];
+                u.upstreamUrl = up.url;
+                await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
+                await env.SUB_STORE.delete(`cache_${targetUid}`);
+                await env.SUB_STORE.delete("admin_action_state");
+                await logAction(env, "分配上游", `UID:${targetUid} → ${up.note || up.url.slice(0, 30)}`);
+                replyText = `✅ 已为用户 [${targetUid}] 分配专属上游！\n\n📡 ${up.note || "上游" + (upIdx + 1)}\n${up.url}\n\n该用户订阅将使用此线路。`;
+              }
+            }
+          }
+        }
+      }
+
       else if (data === "cancel_action") {
         await env.SUB_STORE.delete("admin_action_state");
         // 自动清除操作提示消息
@@ -1663,14 +1725,99 @@ async function handleAdminBot(request, env) {
           [{ text: "📋 用户列表" }, { text: "🔍 查找用户" }],
           [{ text: "📊 用户统计" }, { text: "⏳ 即将到期" }],
           [{ text: "🔎 搜索用户" }, { text: "➕ 手动开卡" }],
-          [{ text: "⏱️ 调整时长" }, { text: "📝 用户备注" }],
-          [{ text: "📤 导出名单" }, { text: "💬 私信用户" }],
+          [{ text: "⏱️ 调整时长" }, { text: "🎯 分配上游" }],
+          [{ text: "📝 用户备注" }, { text: "💬 私信用户" }],
+          [{ text: "📤 导出名单" }],
           [{ text: "🏠 返回主菜单" }]
         ],
         resize_keyboard: true,
         persistent: true
       };
       await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "👥 【用户管理】\n请选择操作：", userMenu);
+      return new Response("OK");
+    }
+
+    // 分配上游（第一步：输入 UID）
+    if (text === "🎯 分配上游") {
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "assign_uid", chatId }));
+      const replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: "🎯 【分配上游】\n请输入用户 UID：\n\n（给指定用户分配专属上游链接）",
+          reply_markup: replyMarkup
+        })
+      });
+      return new Response("OK");
+    }
+
+    // 分配上游流程：输入 UID → 显示上游池选择
+    if (actionState && actionState.mode === "assign_uid" && /^\d+$/.test(text)) {
+      const targetUid = text.trim();
+      const userDataStr = await env.SUB_STORE.get(`user_${targetUid}`);
+      if (!userDataStr) {
+        await env.SUB_STORE.delete("admin_action_state");
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `❌ 用户 UID:${targetUid} 不存在`, MAIN_MENU);
+      } else {
+        const u = JSON.parse(userDataStr);
+        // 保存待分配 UID，显示上游池供选择
+        await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "assign_up", uid: targetUid, chatId }));
+        const pool = await getUpstreamPool(env);
+        const btns = [];
+        pool.forEach((up, i) => {
+          if (up.status !== "active") return;
+          btns.push([{ text: `${up.isDefault ? "⭐" : ""} ${up.note || "上游" + (i + 1)}`, callback_data: `assignup_${i}` }]);
+        });
+        btns.push([{ text: "↩️ 恢复自动分配", callback_data: `assignup_auto` }]);
+        btns.push([{ text: "❌ 取消", callback_data: "cancel_action" }]);
+
+        const currentUp = u.upstreamUrl ? "（当前已指定）" : "（当前为自动分配）";
+        await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: `🎯 【分配上游】\n用户 UID: ${targetUid} ${currentUp}\n\n请选择要分配的上游：`,
+            reply_markup: { inline_keyboard: btns }
+          })
+        });
+      }
+      return new Response("OK");
+    }
+
+    // 分配上游命令：/assign UID 上游序号 或 /assign UID auto
+    if (text.startsWith("/assign ")) {
+      const parts = text.replace("/assign ", "").trim().split(/\s+/);
+      const targetUid = parts[0];
+      const upArg = parts[1];
+      const userDataStr = await env.SUB_STORE.get(`user_${targetUid}`);
+      if (!userDataStr) {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `❌ 用户 UID:${targetUid} 不存在`, MAIN_MENU);
+        return new Response("OK");
+      }
+      const u = JSON.parse(userDataStr);
+      if (upArg === "auto") {
+        delete u.upstreamUrl;
+        await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
+        await env.SUB_STORE.delete(`cache_${targetUid}`);
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `✅ 用户 [${targetUid}] 已恢复自动分配上游！`, MAIN_MENU);
+        return new Response("OK");
+      }
+      const upIdx = parseInt(upArg) - 1;
+      const pool = await getUpstreamPool(env);
+      if (isNaN(upIdx) || upIdx < 0 || upIdx >= pool.length) {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 上游序号无效", MAIN_MENU);
+        return new Response("OK");
+      }
+      const up = pool[upIdx];
+      u.upstreamUrl = up.url;
+      await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
+      await env.SUB_STORE.delete(`cache_${targetUid}`);
+      await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
+        `✅ 已为用户 [${targetUid}] 分配专属上游！\n\n📡 ${up.note || "上游" + (upIdx + 1)}\n${up.url}`,
+        MAIN_MENU);
       return new Response("OK");
     }
 
@@ -3139,17 +3286,21 @@ async function handleAdminBot(request, env) {
               { text: "🗑️ 删除", callback_data: `del_${targetUid}` }
             ],
             [
+              { text: "🎯 分配上游", callback_data: `assign_${targetUid}` },
               { text: "↩️ 撤销删除", callback_data: `undel_${targetUid}` }
             ]
           ]
         };
+
+        // 上游状态显示
+        const upStatus = u.upstreamUrl ? `🎯 已指定:\n${u.upstreamUrl.slice(0, 50)}` : "🔄 自动分配";
 
         await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             chat_id: chatId,
-            text: `📊 【用户档案: ${targetUid}】\n• 状态: ${stateDesc}\n• 剩余: ${Math.max(0, remainDays)} 天\n• 到期: ${new Date(u.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n• ChatID: ${u.chatId || "-"}\n${u.note ? `• 备注: ${u.note}\n` : ""}• 上游: ${u.upstreamUrl}\n• 短链: ${origin}/s/${targetUid}`,
+            text: `📊 【用户档案: ${targetUid}】\n• 状态: ${stateDesc}\n• 剩余: ${Math.max(0, remainDays)} 天\n• 到期: ${new Date(u.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n• ChatID: ${u.chatId || "-"}\n${u.note ? `• 备注: ${u.note}\n` : ""}• 上游: ${upStatus}\n• 短链: ${origin}/s/${targetUid}`,
             reply_markup: replyMarkup
           })
         });
