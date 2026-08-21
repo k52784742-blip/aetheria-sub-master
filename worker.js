@@ -176,8 +176,10 @@ async function unindexUserChatId(env, chatId) {
 }
 
 async function clearUserCache(env, uid) {
-  for (const k of [`cache_${uid}`, `cache_${uid}_legacy`, `cache_${uid}_yaml`]) {
-    try { await env.SUB_STORE.delete(k); } catch (e) {}
+  for (const k of await listAllKeys(env, `cache_${uid}`, 10)) {
+    if (k === `cache_${uid}` || k.startsWith(`cache_${uid}_`)) {
+      try { await env.SUB_STORE.delete(k); } catch (e) {}
+    }
   }
 }
 
@@ -215,6 +217,11 @@ function buildServiceLink(contact) {
   if (contact && contact.startsWith("@")) return `tg://resolve?domain=${contact.replace("@", "")}`;
   if (contact && contact.startsWith("http")) return contact;
   return `tg://resolve?domain=${getStoreBotUsername()}`;
+}
+
+// HTML 转义（防存储型 XSS）
+function escapeHtml(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 // ==================== 套餐管理 ====================
@@ -285,8 +292,8 @@ async function getUpstreamPool(env) {
 const saveUpstreamPool = (env, pool) => env.SUB_STORE.put("upstream_list", JSON.stringify(pool));
 
 async function getUpstreamForUser(env, uid, user) {
-  if (user.upstreamUrl) return user.upstreamUrl;
   const active = (await getUpstreamPool(env)).filter(u => u.status === "active");
+  if (user.upstreamUrl && active.some(u => u.url === user.upstreamUrl)) return user.upstreamUrl;
   if (active.length === 0) return null;
   let hash = 0;
   for (const ch of String(uid)) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
@@ -312,7 +319,7 @@ async function addUpstream(env, url, note) {
 
 async function removeUpstream(env, index) {
   const pool = await getUpstreamPool(env);
-  if (index < 0 || index >= pool.length) return { ok: false, msg: "序号无效" };
+  if (isNaN(index) || index < 0 || index >= pool.length) return { ok: false, msg: "序号无效" };
   const removed = pool.splice(index, 1)[0];
   if (removed.isDefault && pool.length > 0) pool[0].isDefault = true;
   await saveUpstreamPool(env, pool);
@@ -321,7 +328,7 @@ async function removeUpstream(env, index) {
 
 async function setDefaultUpstream(env, index) {
   const pool = await getUpstreamPool(env);
-  if (index < 0 || index >= pool.length) return { ok: false, msg: "序号无效" };
+  if (isNaN(index) || index < 0 || index >= pool.length) return { ok: false, msg: "序号无效" };
   pool.forEach((u, i) => { u.isDefault = (i === index); });
   await saveUpstreamPool(env, pool);
   return { ok: true, msg: `已将第 ${index + 1} 个设为默认` };
@@ -364,7 +371,8 @@ async function fetchUpstreamNodes(env, upstreamUrl) {
     if (!line || !line.includes("://")) continue;
     const parts = line.split("#");
     const basePart = parts[0];
-    let origName = parts[1] ? decodeURIComponent(parts[1]) : "Node";
+    let origName = parts[1] || "Node";
+    if (parts[1]) { try { origName = decodeURIComponent(parts[1]); } catch (e) {} }
     let hostKey = basePart;
     try {
       const u = new URL(basePart.includes("://") ? basePart : "http://" + basePart);
@@ -533,6 +541,15 @@ function generateClashYAML(nodes, brand, uid) {
 }
 
 // ==================== 优惠券 / 卡密 ====================
+// 分块 base64 编码（避免大数组展开超出调用栈限制）
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 32768) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 32768));
+  }
+  return btoa(bin);
+}
+
 function genCode(prefix) {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = prefix + "-";
@@ -682,7 +699,8 @@ async function creditReseller(env, chatId, planPrice) {
   try {
     const aff = await getBuyerAffiliate(env, chatId);
     if (!aff) return;
-    const rate = parseFloat(await env.SUB_STORE.get("comm_rate")) || 10;
+    const parsedRate = parseFloat(await env.SUB_STORE.get("comm_rate"));
+    const rate = Number.isFinite(parsedRate) ? parsedRate : 10;
     const priceNum = parseFloat(String(planPrice || "").replace(/[^\d.]/g, ""));
     if (isNaN(priceNum) || priceNum <= 0) return;
     const commission = +(priceNum * rate / 100).toFixed(2);
@@ -709,7 +727,11 @@ async function getPaymentQRs(env) {
 
 async function savePaymentQRs(env, list) {
   await env.SUB_STORE.put("payment_qrs", JSON.stringify(list));
-  if (list.length > 0) await env.SUB_STORE.put("payment_qr_file_id", list[0].fileId);
+  if (list.length > 0) {
+    await env.SUB_STORE.put("payment_qr_file_id", list[0].fileId);
+  } else {
+    await env.SUB_STORE.delete("payment_qr_file_id");
+  }
 }
 
 async function addPaymentQR(env, fileId, note) {
@@ -721,7 +743,7 @@ async function addPaymentQR(env, fileId, note) {
 
 async function removePaymentQR(env, index) {
   const list = await getPaymentQRs(env);
-  if (index < 0 || index >= list.length) return { ok: false, msg: "序号无效" };
+  if (isNaN(index) || index < 0 || index >= list.length) return { ok: false, msg: "序号无效" };
   list.splice(index, 1);
   await savePaymentQRs(env, list);
   return { ok: true, msg: `已删除第 ${index + 1} 个收款码` };
@@ -947,7 +969,8 @@ async function handleBuyerPortal(uid, request, env) {
 
   const user = JSON.parse(userDataStr);
   const ua = request.headers.get("User-Agent") || "";
-  const isBrowser = ua.includes("Mozilla") || ua.includes("Chrome") || ua.includes("Safari");
+  const accept = request.headers.get("Accept") || "";
+  const isBrowser = (ua.includes("Mozilla") || ua.includes("Chrome") || ua.includes("Safari")) && accept.includes("text/html");
 
   // ===== 浏览器访问 → 控制面板 =====
   if (isBrowser) {
@@ -960,10 +983,10 @@ async function handleBuyerPortal(uid, request, env) {
     const statusText = disabled ? "服务已暂停" : (expired ? "已过期" : "正常运行中");
     const renewUrl = `${getStoreOrigin(request)}/renew/${uid}`;
     const expireDate = new Date(user.expiry).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" });
-    const plan = user.plan || "标准套餐";
-    const price = user.price || "";
+    const plan = escapeHtml(user.plan || "标准套餐");
+    const price = escapeHtml(user.price || "");
     const serviceLink = buildServiceLink(await env.SUB_STORE.get("service_contact") || "");
-    const notice = await env.SUB_STORE.get("notice_content") || "";
+    const notice = escapeHtml(await env.SUB_STORE.get("notice_content") || "");
     const createdAt = user.createdAt || user.expiry - (30 * 86400000);
     const createdDate = new Date(createdAt).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
     const sourceDesc = user.source === "card" ? "卡密兑换" : (user.source === "coupon" ? "优惠券" : "官方购买");
@@ -1049,7 +1072,7 @@ async function handleBuyerPortal(uid, request, env) {
         <div class="stat-value">${createdDate}</div>
       </div>
     </div>
-    ${disabled ? "" : `
+    ${disabled || expired ? "" : `
     <div class="progress-box">
       <div class="progress-label">
         <span>📈 有效期使用进度</span>
@@ -1129,8 +1152,20 @@ async function handleBuyerPortal(uid, request, env) {
   if (cachedContent) {
     return new Response(cachedContent, {
       headers: yamlMode
-        ? { "Content-Type": "application/yaml; charset=utf-8", "Access-Control-Allow-Origin": "*", "Profile-Update-Interval": "24" }
-        : { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" }
+        ? {
+          "Content-Type": "application/yaml; charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+          "Profile-Update-Interval": "24",
+          "Subscription-Userinfo": `upload=0; download=0; total=0; expire=${Math.floor(user.expiry / 1000)}`,
+          "Cache-Control": "no-store"
+        }
+        : {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+          "Profile-Update-Interval": "24",
+          "Subscription-Userinfo": `upload=0; download=0; total=0; expire=${Math.floor(user.expiry / 1000)}`,
+          "Cache-Control": "no-store"
+        }
     });
   }
 
@@ -1170,7 +1205,8 @@ async function handleBuyerPortal(uid, request, env) {
 
     const parts = line.split("#");
     const basePart = parts[0];
-    let origName = parts[1] ? decodeURIComponent(parts[1]) : "Node";
+    let origName = parts[1] || "Node";
+    if (parts[1]) { try { origName = decodeURIComponent(parts[1]); } catch (e) {} }
 
     if (["官网", "测试", "过期", "到期"].some(kw => origName.includes(kw))) continue;
     ["上游", "机场", "aff", "www.", ".com", "TG@"].forEach(w => { origName = origName.split(w).join(""); });
@@ -1218,7 +1254,7 @@ async function handleBuyerPortal(uid, request, env) {
     });
   }
 
-  const finalBase64 = btoa(String.fromCharCode(...new TextEncoder().encode(finalOutput)));
+  const finalBase64 = bytesToBase64(new TextEncoder().encode(finalOutput));
   await env.SUB_STORE.put(cacheKey, finalBase64, { expirationTtl: 7200 });
 
   return new Response(finalBase64, {
@@ -1336,7 +1372,7 @@ async function handleResellerLanding(code, request, env) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${reseller ? reseller.name : "推广链接"} · ${DEFAULT_BRAND} 节点</title>
+  <title>${reseller ? escapeHtml(reseller.name) : "推广链接"} · ${escapeHtml(DEFAULT_BRAND)} 节点</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: linear-gradient(135deg, #0f172a, #1e1b4b); color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }
     .card { background: rgba(30, 41, 59, 0.95); padding: 32px; border-radius: 20px; width: 100%; max-width: 420px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.7); border: 1px solid rgba(148,163,184,0.15); text-align: center; }
@@ -1351,9 +1387,9 @@ async function handleResellerLanding(code, request, env) {
 <body>
   <div class="card">
     <span class="badge">💰 专属优惠渠道</span>
-    <h2>${reseller ? reseller.name : "推广链接"}</h2>
-    <div class="desc">由分销商「${reseller ? reseller.name : "未知"}」为您推荐<br>${DEFAULT_BRAND} 高速节点服务</div>
-    <a class="btn" href="tg://resolve?domain=${getStoreBotUsername()}&start=${code}">🚀 前往购买 (推荐人: ${reseller ? reseller.name : "—"})</a>
+    <h2>${reseller ? escapeHtml(reseller.name) : "推广链接"}</h2>
+    <div class="desc">由分销商「${reseller ? escapeHtml(reseller.name) : "未知"}」为您推荐<br>${escapeHtml(DEFAULT_BRAND)} 高速节点服务</div>
+    <a class="btn" href="tg://resolve?domain=${getStoreBotUsername()}&start=${code}">🚀 前往购买 (推荐人: ${reseller ? escapeHtml(reseller.name) : "—"})</a>
     <a class="btn" href="${getStoreOrigin(request)}">🌐 查看官网</a>
     <div class="note">AETHERIA Power · 优质节点服务</div>
   </div>
@@ -1461,7 +1497,7 @@ async function handleStoreBot(request, env) {
     if (msg.chat && msg.chat.type && msg.chat.type !== "private") return new Response("OK");
 
     const chatId = msg.chat.id;
-    let text = msg.text || "";
+    let text = msg.text || msg.caption || "";
 
     // 左侧命令菜单 → 菜单按钮映射
     const cmdMap = {
@@ -1473,7 +1509,7 @@ async function handleStoreBot(request, env) {
     // 购买套餐（含分销深链解析）
     if (text === "🛒 购买套餐" || text === "/buy" || text.startsWith("/start") || text.includes("购买")) {
       if (text.startsWith("/start")) {
-        const startPayload = (msg.text || "").split(" ")[1] || "";
+        const startPayload = ((msg.text || "").split(/\s+/)[1] || "").trim();
         if (startPayload) {
           const resellers = await listAllKeys(env, "reseller_", 2000);
           for (const k of resellers) {
@@ -1606,9 +1642,9 @@ async function handleStoreBot(request, env) {
       return new Response("OK");
     }
 
-    // 优惠券输入（处于兑换状态或直接发 CP- 前缀）
+    // 优惠券输入（处于兑换状态或直接发 CP- 前缀；卡密 MB- 前缀不被劫持）
     const couponStateStr = await env.SUB_STORE.get(`coupon_state_${chatId}`);
-    if ((couponStateStr || /^CP-/.test(text.toUpperCase())) && text.trim()) {
+    if ((couponStateStr || /^CP-/.test(text.toUpperCase())) && !/^MB-/.test(text.toUpperCase()) && text.trim()) {
       const cCode = text.trim().toUpperCase();
       const cResult = await redeemCoupon(env, cCode, chatId);
       await env.SUB_STORE.delete(`coupon_state_${chatId}`);
@@ -1686,7 +1722,7 @@ async function handleStoreBot(request, env) {
 
     // ===== 付款凭证审核流程（带媒体）=====
     if (!(await rateLimit(env, "proof", chatId, 30))) {
-      await sendMenu(STORE_BOT_TOKEN, chatId, "⏳ 凭证已提交，请耐心等待审核（30秒内请勿重复发送）", STORE_MENU);
+      await sendMenu(STORE_BOT_TOKEN, chatId, "⏳ 操作太频繁，请稍等 30 秒再发送截图", STORE_MENU);
       return new Response("OK");
     }
 
@@ -1724,10 +1760,14 @@ async function handleStoreBot(request, env) {
 
     const replyMarkup = {
       inline_keyboard: [
-        [
-          { text: "🟢 确认到账 · 一键开通", callback_data: `approve_${chatId}_${orderInfo ? orderInfo.orderId : "0"}` },
-          { text: "⏳ 稍后处理", callback_data: "later" }
-        ]
+        orderInfo
+          ? [
+            { text: "🟢 确认到账 · 一键开通", callback_data: `approve_${chatId}_${orderInfo.orderId}` },
+            { text: "⏳ 稍后处理", callback_data: "later" }
+          ]
+          : [
+            { text: "⚠️ 无匹配订单，需人工核实", callback_data: "later" }
+          ]
       ]
     };
 
@@ -1769,6 +1809,10 @@ async function handleAdminBot(request, env) {
         const rparts = data.replace("approve_renew_", "").split("_");
         const rUid = rparts[0];
         const rChatId = rparts.slice(1).join("_");
+        const renewProcessedKey = `processed_renew_${rUid}_${cb.message.message_id}`;
+        if (await env.SUB_STORE.get(renewProcessedKey)) {
+          replyAlert = "⚠️ 该续费请求已被处理过了，请勿重复操作！";
+        } else {
         const rUserStr = await env.SUB_STORE.get(`user_${rUid}`);
         if (!rUserStr) {
           replyText = `❌ 用户 UID:${rUid} 不存在`;
@@ -1776,6 +1820,7 @@ async function handleAdminBot(request, env) {
           const ru = JSON.parse(rUserStr);
           const days = parseInt(await env.SUB_STORE.get("default_days")) || DEFAULT_DAYS;
           const prevExpiry = ru.expiry;
+          await env.SUB_STORE.put(renewProcessedKey, JSON.stringify({ chatId: rChatId, time: Date.now() }), { expirationTtl: 86400 });
           ru.expiry = Math.max(ru.expiry, Date.now()) + (days * 86400000);
           ru.status = "active";
           await env.SUB_STORE.put(`user_${rUid}`, JSON.stringify(ru));
@@ -1802,6 +1847,7 @@ async function handleAdminBot(request, env) {
               `✅ 【续费已处理】\nUID: ${rUid}\n时长: +${days} 天\n\n如需撤销请点击下方按钮。`,
               { inline_keyboard: [[{ text: "↩️ 撤销此操作", callback_data: `revoke_${cb.message.message_id}` }]] });
           } catch (e) {}
+        }
         }
       }
       else if (data.startsWith("reject_renew_")) {
@@ -1856,9 +1902,11 @@ async function handleAdminBot(request, env) {
           ? `${orderPlan.planName} (${orderPlan.planPrice || ""})`
           : `${days} 天套餐`;
 
-        const processedKey = `processed_${cb.message.message_id}`;
+        const processedKey = `processed_${targetChatId}_${approveOrderId || "0"}`;
         if (await env.SUB_STORE.get(processedKey)) {
           replyAlert = "⚠️ 该凭证已被处理过了，请勿重复操作！";
+        } else if (approveOrderId && approveOrderId !== "0" && !orderPlan) {
+          replyAlert = "❌ 该订单不存在或已过期，请让买家重新下单";
         } else if (!defaultUpstream) {
           replyAlert = "❌ 错误：请先在管理端配置默认上游链接！";
         } else {
@@ -2071,7 +2119,7 @@ async function handleAdminBot(request, env) {
             replyText = `🟢 用户 [${uid}] 已激活！\n\n服务已恢复。`;
             replyMarkup = { inline_keyboard: [[{ text: "🔴 禁用", callback_data: `disable_${uid}` }]] };
           } else if (action === "del") {
-            const delId = Date.now();
+            const delId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
             await env.SUB_STORE.put(`revoke_del_${delId}`, JSON.stringify({ uid, data: JSON.parse(userDataStr), time: Date.now() }), { expirationTtl: 86400 });
             await env.SUB_STORE.delete(`user_${uid}`);
             await clearUserCache(env, uid);
@@ -2085,9 +2133,9 @@ async function handleAdminBot(request, env) {
 
       // 用户列表翻页
       else if (data.startsWith("ulist_")) {
-        const page = parseInt(data.replace("ulist_", "")) || 1;
         const allUsers = (await listAllKeys(env, "user_", 10000)).map(k => k.replace("user_", ""));
         const totalPages = Math.max(1, Math.ceil(allUsers.length / 5));
+        const page = Math.max(1, Math.min(parseInt(data.replace("ulist_", "")) || 1, totalPages));
         const pageUsers = allUsers.slice((page - 1) * 5, (page - 1) * 5 + 5);
 
         let listText = `👥 【用户列表】 (第 ${page}/${totalPages} 页)\n\n`;
@@ -2215,7 +2263,7 @@ async function handleAdminBot(request, env) {
             replyText = `💬 【私信用户】\nUID:${pickUid}\n\n请输入要发送的消息内容：`;
             replyMarkup = CANCEL_BTN;
           } else if (mode === "del") {
-            const delId = Date.now();
+            const delId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
             await env.SUB_STORE.put(`revoke_del_${delId}`, JSON.stringify({ uid: pickUid, data: JSON.parse(pickUserStr), time: Date.now() }), { expirationTtl: 86400 });
             await env.SUB_STORE.delete(`user_${pickUid}`);
             await clearUserCache(env, pickUid);
@@ -2514,6 +2562,10 @@ async function handleAdminBot(request, env) {
           return new Response("OK");
         }
         expireDate.setHours(23, 59, 59, 999);
+        if (expireDate.getTime() < Date.now()) {
+          await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 到期日期不能是过去的时间，请重新输入", MAIN_MENU);
+          return new Response("OK");
+        }
         days = Math.max(1, Math.ceil((expireDate.getTime() - Date.now()) / 86400000));
         tip = `（自定义到期 ${m[1]}-${m[2]}-${m[3]}，共 ${days} 天）`;
       } else {
@@ -2531,6 +2583,19 @@ async function handleAdminBot(request, env) {
     // 手动开卡：等待 ChatID
     if (state("newuser") && /^\d+$/.test(text)) {
       const targetChatId = parseInt(text);
+      if (!Number.isSafeInteger(targetChatId)) {
+        await env.SUB_STORE.delete("admin_action_state");
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ ChatID 无效，请输入正确的数字", MAIN_MENU);
+        return new Response("OK");
+      }
+      const existingByChat = await findUidByChatId(env, targetChatId);
+      if (existingByChat) {
+        await env.SUB_STORE.delete("admin_action_state");
+        await sendMenu(ADMIN_BOT_TOKEN, chatId,
+          `⚠️ 该 ChatID 已有订阅（UID:${existingByChat}）\n\n如需续费请用「⏱️ 调整时长」给该用户加时长，避免重复开卡产生两个账号。`,
+          MAIN_MENU);
+        return new Response("OK");
+      }
       const days = actionState.days;
       const upstream = await getDefaultUpstream(env);
       if (!upstream) {
@@ -2549,7 +2614,7 @@ async function handleAdminBot(request, env) {
       await sendText(STORE_BOT_TOKEN, targetChatId, `🎉 【开通成功】\n您的专属订阅已开通！\n\n🔗 专属短链:\n\`${subLink}\`\n\n服务时长: ${days} 天`);
       await env.SUB_STORE.delete("admin_action_state");
 
-      const mId = Date.now();
+      const mId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
       await env.SUB_STORE.put(`revoke_manual_${mId}`, JSON.stringify({ uid: newUid, isNew: true, chatId: targetChatId, time: Date.now() }), { expirationTtl: 86400 });
       await sendMenu(ADMIN_BOT_TOKEN, chatId,
         `✅ 【手动开卡成功】\n\n• 新 UID: \`${newUid}\`\n• 时长: ${days} 天\n• 买家 ChatID: ${targetChatId}\n• 订阅链接: ${subLink}\n\n已通知买家。\n如需撤销请点击下方按钮：`,
@@ -2688,11 +2753,27 @@ async function handleAdminBot(request, env) {
         await env.SUB_STORE.put(`user_${uid}`, JSON.stringify(u));
         await env.SUB_STORE.delete("admin_action_state");
 
-        const adjId = Date.now();
+        const adjId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
         await env.SUB_STORE.put(`revoke_adjust_${adjId}`, JSON.stringify({ uid, prevExpiry, delta, time: Date.now() }), { expirationTtl: 86400 });
         const newRemain = Math.ceil((u.expiry - Date.now()) / 86400000);
         await sendMenu(ADMIN_BOT_TOKEN, chatId,
           `✅ 【时长已调整】\nUID:${uid}\n调整: ${delta > 0 ? "+" : ""}${delta} 天\n当前剩余: ${Math.max(0, newRemain)} 天\n到期: ${new Date(u.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n\n如需撤销请点击下方按钮：`,
+          { inline_keyboard: [[{ text: "↩️ 撤销本次调整", callback_data: `revoke_adjust_${adjId}` }]] });
+        return new Response("OK");
+      } else if (/^set\s+(\d+)\s*天?$/.test(input)) {
+        const days = parseInt(input.match(/^set\s+(\d+)\s*天?$/)[1]);
+        if (days <= 0 || days > 3650) {
+          await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 天数无效（1-3650）", MAIN_MENU);
+          return new Response("OK");
+        }
+        u.expiry = Date.now() + (days * 86400000);
+        u.status = "active";
+        await env.SUB_STORE.put(`user_${uid}`, JSON.stringify(u));
+        await env.SUB_STORE.delete("admin_action_state");
+        const adjId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        await env.SUB_STORE.put(`revoke_adjust_${adjId}`, JSON.stringify({ uid, prevExpiry, delta: days, time: Date.now() }), { expirationTtl: 86400 });
+        await sendMenu(ADMIN_BOT_TOKEN, chatId,
+          `✅ 【到期时间已设置】\nUID:${uid}\n设为剩余 ${days} 天\n到期: ${new Date(u.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n\n如需撤销请点击下方按钮：`,
           { inline_keyboard: [[{ text: "↩️ 撤销本次调整", callback_data: `revoke_adjust_${adjId}` }]] });
         return new Response("OK");
       } else {
@@ -2790,8 +2871,8 @@ async function handleAdminBot(request, env) {
       const days = parseInt(text.trim());
       const qty = actionState.qty || 10;
       await env.SUB_STORE.delete("admin_action_state");
-      if (isNaN(days) || days <= 0) {
-        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 无效天数", MAIN_MENU);
+      if (isNaN(days) || days <= 0 || days > 3650) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 无效天数（1-3650）", MAIN_MENU);
       } else {
         const price = (await env.SUB_STORE.get("price_info")) || "";
         const cards = await genCards(env, qty, days, `${days} 天套餐`, price);
@@ -2819,7 +2900,7 @@ async function handleAdminBot(request, env) {
     // 群发通知（带二次确认，防误发）
     if (state("broadcast")) {
       const content = text.trim();
-      if (content === "✅ 确认群发" || content === "确认") {
+      if (content === "✅ 确认群发") {
         const userKeys = await listAllKeys(env, "user_", 10000);
         let sentCount = 0;
         const draft = actionState.draft || "";
@@ -2952,6 +3033,10 @@ async function handleAdminBot(request, env) {
       const parts = input.split(/\s+/);
       const arg = parts[0];
       const upIdx = (parts[1] ? parseInt(parts[1]) : 1) - 1;
+      if (isNaN(upIdx) || upIdx < 0) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, `❌ 无效格式\n请输入：节点序号 或 节点序号 上游序号\n例如：\`1,3,5\` 或 \`1,3,5 2\``, MAIN_MENU);
+        return new Response("OK");
+      }
       const action = actionState.action;
       await env.SUB_STORE.delete("admin_action_state");
       if (arg !== "all" && !/^[\d,\s]+$/.test(arg)) {
@@ -3054,7 +3139,7 @@ async function handleAdminBot(request, env) {
       const note = parts.slice(1).join(" ");
       const pool = await getUpstreamPool(env);
       await env.SUB_STORE.delete("admin_action_state");
-      if (idx < 0 || idx >= pool.length || !note) {
+      if (isNaN(idx) || idx < 0 || idx >= pool.length || !note) {
         await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 格式：序号 备注\n例如：1 日本节点", MAIN_MENU);
       } else {
         pool[idx].note = note;
@@ -3452,7 +3537,7 @@ async function handleAdminBot(request, env) {
       const idx = parseInt(parts[0]) - 1;
       const note = parts.slice(1).join(" ");
       const pool = await getUpstreamPool(env);
-      if (idx < 0 || idx >= pool.length || !note) {
+      if (isNaN(idx) || idx < 0 || idx >= pool.length || !note) {
         await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 格式：/noteurl 序号 备注", MAIN_MENU);
       } else {
         pool[idx].note = note;
@@ -3505,6 +3590,10 @@ async function handleAdminBot(request, env) {
       const upIdx = (parts[1] ? parseInt(parts[1]) : 1) - 1;
       if (arg !== "all" && !/^[\d,\s]+$/.test(arg)) {
         await sendMenu(ADMIN_BOT_TOKEN, chatId, `❌ 格式：/${action === "off" ? "nodeoff" : "nodeon"} 1,3,5 或 /${action === "off" ? "nodeoff" : "nodeon"} all [上游序号=1]`, MAIN_MENU);
+        return;
+      }
+      if (isNaN(upIdx) || upIdx < 0) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, `❌ 上游序号无效\n格式：/${action === "off" ? "nodeoff" : "nodeon"} 1,3,5 [上游序号=1]`, MAIN_MENU);
         return;
       }
       const r = await batchToggleNodes(env, action, arg === "all" ? "all" : arg, upIdx);
@@ -4072,6 +4161,12 @@ async function handleAdminBot(request, env) {
     }
 
     // 默认兜底：识别未支持的斜杠命令，其余引导到菜单
+    if (actionState && actionState.mode) {
+      await sendMenu(ADMIN_BOT_TOKEN, chatId,
+        `⚠️ 当前有未完成的操作，请按引导继续输入，或点击下方按钮取消：`,
+        { inline_keyboard: [[{ text: "❌ 取消当前操作", callback_data: "cancel_action" }]] });
+      return new Response("OK");
+    }
     if (text.startsWith("/")) {
       await sendMenu(ADMIN_BOT_TOKEN, chatId,
         `❓ 未识别的命令 \`${text.split(" ")[0]}\`\n\n发送 /start 查看帮助，或使用下方菜单操作。`,
