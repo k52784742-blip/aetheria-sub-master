@@ -543,11 +543,23 @@ function genCode(prefix) {
   return code;
 }
 
+// 生成不重复的券码/卡密（避免碰撞覆盖已存在数据）
+async function genUniqueCode(env, prefix) {
+  for (let i = 0; i < 10; i++) {
+    const code = genCode(prefix);
+    const exists = prefix === "MB"
+      ? await env.SUB_STORE.get(`card_${code}`)
+      : await env.SUB_STORE.get(`coupon_${code}`);
+    if (!exists) return code;
+  }
+  return genCode(prefix);
+}
+
 async function genCoupons(env, count, days, discountPct, note) {
   const coupons = [];
   for (let i = 0; i < count; i++) {
     const coupon = {
-      code: genCode("CP"), days,
+      code: await genUniqueCode(env, "CP"), days,
       discountPct, note: note || "优惠券",
       status: "unused", usedBy: null, usedAt: null, createdAt: Date.now()
     };
@@ -562,7 +574,7 @@ async function genCards(env, count, days, planName, price) {
   const batchId = "B" + Date.now().toString(36).toUpperCase();
   for (let i = 0; i < count; i++) {
     const card = {
-      code: genCode("MB"), days,
+      code: await genUniqueCode(env, "MB"), days,
       planName: planName || `${days} 天套餐`, price: price || "",
       status: "unused", usedBy: null, usedAt: null, batchId, createdAt: Date.now()
     };
@@ -793,7 +805,8 @@ async function sendDailyReport(env) {
     const userKeys = await listAllKeys(env, "user_", 10000);
     const now = Date.now();
     const dayMs = 86400000;
-    const todayStart = new Date().setHours(0, 0, 0, 0);
+    const nowD = new Date();
+    const todayStart = Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate());
 
     let yesterdayNew = 0, yesterdayRenew = 0, yesterdayCard = 0, totalOrders = 0;
     for (const k of recordKeys) {
@@ -887,6 +900,21 @@ async function buildOverview(env) {
     else activeCount++;
   }
 
+  // 今日经营数据（按 UTC 0 点分界）
+  const nowD = new Date();
+  const todayStart = Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate());
+  let todayNew = 0, todayRenew = 0, todayCard = 0, todayAmount = 0;
+  for (const k of await listAllKeys(env, "record_", 5000)) {
+    const r = JSON.parse(await env.SUB_STORE.get(k));
+    if (r.time >= todayStart) {
+      if (r.via === "card") todayCard++;
+      else if (r.type === "renew") todayRenew++;
+      else todayNew++;
+      const n = parseFloat(String(r.price || "").replace(/[^\d.]/g, ""));
+      if (!isNaN(n)) todayAmount += n;
+    }
+  }
+
   let cardUnused = 0;
   for (const k of await listAllKeys(env, "card_", 10000)) {
     if (JSON.parse(await env.SUB_STORE.get(k)).status === "unused") cardUnused++;
@@ -894,6 +922,8 @@ async function buildOverview(env) {
 
   const mergeMode = await isMergeMode(env);
   return `📊 【系统运行大盘】\n\n` +
+    `📈 今日经营: 新购 ${todayNew} | 续费 ${todayRenew} | 卡密 ${todayCard}\n` +
+    `💰 今日流水: ${todayAmount.toFixed(2)} 元\n\n` +
     `👥 用户总数: ${userKeys.length}\n` +
     `　🟢 正常: ${activeCount} | ⏳ 过期: ${expiredCount} | 🔴 禁用: ${disabledCount}\n` +
     `📦 待审订单: ${pendingKeys.length}\n` +
@@ -1214,6 +1244,7 @@ async function handleRenewPage(uid, request, env) {
 
   // 过期或 7 天内到期才通知管理员（30 分钟内防抖）
   const remainDays = (user.expiry - Date.now()) / 86400000;
+  const disabledUser = user.status === "disabled";
   if (user.status === "active" && remainDays <= 7 && chatId) {
     try {
       const lastNotified = await env.SUB_STORE.get(`renew_notify_${uid}`);
@@ -1259,13 +1290,13 @@ async function handleRenewPage(uid, request, env) {
 <body>
   <div class="card">
     <h2>🔄 续费申请</h2>
-    <div class="desc">您的订阅即将到期，请完成续费</div>
+    <div class="desc">${disabledUser ? "您的服务已被暂停，请联系客服处理" : "您的订阅即将到期，请完成续费"}</div>
     <div class="info">
       <p>• 订阅编号: <span>UID-${uid}</span></p>
       <p>• 续费时长: <span>${days} 天</span></p>
       <p>• 费用: <span>${price}</span></p>
     </div>
-    <p>✅ 续费申请已自动提交给管理员！</p>
+    <p>${disabledUser ? "🔴 服务暂停中，暂无法在线续费。" : "✅ 续费申请已自动提交给管理员！"}</p>
     <p style="color:#94a3b8; font-size:13px; margin:12px 0;">请前往 Telegram 联系客服完成付款，付款后管理员将立即为您开通。</p>
     <a class="btn btn-secondary" href="${serviceLink}">📩 联系客服</a>
     <a class="btn" href="/s/${uid}">🏠 返回控制台</a>
@@ -2495,8 +2526,14 @@ async function handleAdminBot(request, env) {
     if (state("newuser") && /^\d+$/.test(text)) {
       const targetChatId = parseInt(text);
       const days = actionState.days;
-      const newUid = await genUniqueUid(env);
       const upstream = await getDefaultUpstream(env);
+      if (!upstream) {
+        await env.SUB_STORE.delete("admin_action_state");
+        await sendMenu(ADMIN_BOT_TOKEN, chatId,
+          "❌ 尚未配置上游订阅源，无法开卡！\n\n请先用 /addurl 链接 添加上游，再执行手动开卡。", MAIN_MENU);
+        return new Response("OK");
+      }
+      const newUid = await genUniqueUid(env);
       await env.SUB_STORE.put(`user_${newUid}`, JSON.stringify({
         upstreamUrl: upstream, expiry: Date.now() + (days * 86400000), status: "active",
         brand: DEFAULT_BRAND, chatId: targetChatId, createdAt: Date.now(), plan: `${days} 天套餐`
@@ -2773,18 +2810,38 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // 群发通知
+    // 群发通知（带二次确认，防误发）
     if (state("broadcast")) {
-      const userKeys = await listAllKeys(env, "user_", 10000);
-      let sentCount = 0;
-      for (const k of userKeys) {
-        const u = JSON.parse(await env.SUB_STORE.get(k));
-        if (u.chatId) {
-          try { await sendText(STORE_BOT_TOKEN, u.chatId, `📢 ${text}`); sentCount++; } catch (e) {}
+      const content = text.trim();
+      if (content === "✅ 确认群发" || content === "确认") {
+        const userKeys = await listAllKeys(env, "user_", 10000);
+        let sentCount = 0;
+        const draft = actionState.draft || "";
+        for (const k of userKeys) {
+          const u = JSON.parse(await env.SUB_STORE.get(k));
+          if (u.chatId) {
+            try { await sendText(STORE_BOT_TOKEN, u.chatId, `📢 ${draft}`); sentCount++; } catch (e) {}
+          }
         }
+        await env.SUB_STORE.delete("admin_action_state");
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, `✅ 【群发完成】\n已发送给 ${sentCount} 位用户`, MAIN_MENU);
+      } else if (content === "❌ 取消群发" || content === "取消") {
+        await env.SUB_STORE.delete("admin_action_state");
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 已取消群发", MAIN_MENU);
+      } else if (!content) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 内容为空，已取消", MAIN_MENU);
+        await env.SUB_STORE.delete("admin_action_state");
+      } else {
+        const userKeys = await listAllKeys(env, "user_", 10000);
+        let targetCount = 0;
+        for (const k of userKeys) {
+          try { if (JSON.parse(await env.SUB_STORE.get(k)).chatId) targetCount++; } catch (e) {}
+        }
+        await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "broadcast", draft: content, chatId }));
+        await sendMenu(ADMIN_BOT_TOKEN, chatId,
+          `📣 【群发预览】\n\n将发送给 ${targetCount} 位已绑定用户：\n\n${content}\n\n点击下方按钮确认发送，或取消：`,
+          { keyboard: [[{ text: "✅ 确认群发" }, { text: "❌ 取消群发" }]], resize_keyboard: true, persistent: true });
       }
-      await env.SUB_STORE.delete("admin_action_state");
-      await sendMenu(ADMIN_BOT_TOKEN, chatId, `✅ 【群发完成】\n已发送给 ${sentCount} 位用户`, MAIN_MENU);
       return new Response("OK");
     }
 
