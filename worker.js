@@ -94,13 +94,14 @@ const STORE_MENU = {
 
 const MAIN_MENU = {
   keyboard: [
-    [{ text: "➕ 手动开卡" }, { text: "🔎 搜索用户" }],
-    [{ text: "📊 用户统计" }, { text: "⏳ 即将到期" }],
-    [{ text: "📤 导出名单" }, { text: "📦 订单管理" }],
-    [{ text: "🎫 卡密管理" }, { text: "📦 套餐管理" }],
-    [{ text: "⚙️ 系统设置" }, { text: "💰 分销系统" }],
-    [{ text: "📣 群发通知" }, { text: "📊 系统概览" }],
-    [{ text: "📜 操作日志" }, { text: "❓ 帮助说明" }]
+    [{ text: "➕ 手动开卡" }, { text: "📋 用户列表" }],
+    [{ text: "🔎 搜索用户" }, { text: "📊 用户统计" }],
+    [{ text: "⏳ 即将到期" }, { text: "📤 导出名单" }],
+    [{ text: "📦 订单管理" }, { text: "🎫 卡密管理" }],
+    [{ text: "📦 套餐管理" }, { text: "⚙️ 系统设置" }],
+    [{ text: "💰 分销系统" }, { text: "📣 群发通知" }],
+    [{ text: "📊 系统概览" }, { text: "📜 操作日志" }],
+    [{ text: "❓ 帮助说明" }]
   ],
   resize_keyboard: true,
   persistent: true
@@ -729,7 +730,7 @@ async function convertQRForStoreBot(adminFileId) {
     const fileRes = await fetch(`${TG_API}${ADMIN_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(adminFileId)}`);
     const fileJson = await fileRes.json();
     if (!fileJson.ok || !fileJson.result || !fileJson.result.file_path) return null;
-    const imgRes = await fetch(`${TG_API}${ADMIN_BOT_TOKEN}/${fileJson.result.file_path}`.replace(`${TG_API}${ADMIN_BOT_TOKEN}/`, `https://api.telegram.org/file/bot${ADMIN_BOT_TOKEN}/`));
+    const imgRes = await fetch(`https://api.telegram.org/file/bot${ADMIN_BOT_TOKEN}/${fileJson.result.file_path}`);
     if (!imgRes.ok) return null;
     const imgBlob = await imgRes.blob();
 
@@ -2324,7 +2325,7 @@ async function handleAdminBot(request, env) {
             if (arg === "auto") {
               delete u.upstreamUrl;
               await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
-              await env.SUB_STORE.delete(`cache_${targetUid}`);
+              await clearUserCache(env, targetUid);
               await env.SUB_STORE.delete("admin_action_state");
               replyText = `✅ 用户 [${targetUid}] 已恢复自动分配上游！`;
             } else {
@@ -2336,7 +2337,7 @@ async function handleAdminBot(request, env) {
                 const up = pool[upIdx];
                 u.upstreamUrl = up.url;
                 await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
-                await env.SUB_STORE.delete(`cache_${targetUid}`);
+                await clearUserCache(env, targetUid);
                 await env.SUB_STORE.delete("admin_action_state");
                 await logAction(env, "分配上游", `UID:${targetUid} → ${up.note || up.url.slice(0, 30)}`);
                 replyText = `✅ 已为用户 [${targetUid}] 分配专属上游！\n\n📡 ${up.note || "上游" + (upIdx + 1)}\n${up.url}\n\n该用户订阅将使用此线路。`;
@@ -2907,7 +2908,7 @@ async function handleAdminBot(request, env) {
       if (upArg === "auto") {
         delete u.upstreamUrl;
         await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
-        await env.SUB_STORE.delete(`cache_${targetUid}`);
+        await clearUserCache(env, targetUid);
         await sendMenu(ADMIN_BOT_TOKEN, chatId, `✅ 用户 [${targetUid}] 已恢复自动分配上游！`, MAIN_MENU);
         return new Response("OK");
       }
@@ -2920,7 +2921,7 @@ async function handleAdminBot(request, env) {
       const up = pool[upIdx];
       u.upstreamUrl = up.url;
       await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
-      await env.SUB_STORE.delete(`cache_${targetUid}`);
+      await clearUserCache(env, targetUid);
       await sendMenu(ADMIN_BOT_TOKEN, chatId, `✅ 已为用户 [${targetUid}] 分配专属上游！\n\n📡 ${up.note || "上游" + (upIdx + 1)}\n${up.url}`, MAIN_MENU);
       return new Response("OK");
     }
@@ -3377,8 +3378,18 @@ async function handleAdminBot(request, env) {
         await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 格式：/gencp 数量 天数 折扣 备注\n例：/gencp 5 30 80 八折月卡", MAIN_MENU);
         return new Response("OK");
       }
-      const days = parseInt(parts[2]) || 30;
-      const discount = parseInt(parts[3]) || 100;
+      const daysArg = parts[2];
+      const days = daysArg === undefined ? 30 : parseInt(daysArg);
+      if (!days || days <= 0 || days > 3650) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 天数无效（1-3650）\n例：/gencp 5 30 80 八折月卡", MAIN_MENU);
+        return new Response("OK");
+      }
+      const discountArg = parts[3];
+      const discount = discountArg === undefined ? 100 : parseInt(discountArg);
+      if (!discount || discount <= 0 || discount > 100) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 折扣无效（1-100，80=8折）\n例：/gencp 5 30 80 八折月卡", MAIN_MENU);
+        return new Response("OK");
+      }
       const note = parts.slice(4).join(" ") || `${days} 天优惠券`;
       const coupons = await genCoupons(env, count, days, discount, note);
       await sendCodes(ADMIN_BOT_TOKEN, chatId, coupons.map(c => c.code));
@@ -3442,7 +3453,8 @@ async function handleAdminBot(request, env) {
         await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 格式错误！\n请使用：`/gencard 数量 天数 价格`\n例：`/gencard 10 30 30元`", MAIN_MENU);
         return new Response("OK");
       }
-      const days = parseInt(parts[2]) || (parseInt(await env.SUB_STORE.get("default_days")) || DEFAULT_DAYS);
+      let days = parseInt(parts[2]);
+      if (!days || days <= 0 || days > 3650) days = parseInt(await env.SUB_STORE.get("default_days")) || DEFAULT_DAYS;
       const price = parts[3] || (await env.SUB_STORE.get("price_info")) || "";
       const cards = await genCards(env, count, days, `${days} 天套餐`, price);
       await sendCodes(ADMIN_BOT_TOKEN, chatId, cards.map(c => c.code), `🎫 【卡密生成成功】\n\n• 数量: ${count}\n• 时长: ${days} 天\n• 价格: ${price || "未设置"}\n\n`);
@@ -3646,7 +3658,6 @@ async function handleAdminBot(request, env) {
       const upstream = text.replace("/setup ", "").trim();
       const r = await addUpstream(env, upstream, "手动设置");
       if (r.ok) {
-        await env.SUB_STORE.put("default_upstream_url", upstream);
         await sendMenu(ADMIN_BOT_TOKEN, chatId, `✅ ${r.msg}${r.isDefault ? "（已设为默认）" : ""}\n\n如需管理多个上游，请用 /addurl 添加更多。`, MAIN_MENU);
       } else {
         await sendMenu(ADMIN_BOT_TOKEN, chatId, `❌ ${r.msg}\n如需更换请使用 /addurl 添加`, MAIN_MENU);
