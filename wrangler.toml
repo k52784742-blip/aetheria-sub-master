@@ -5,7 +5,7 @@
 name = "aetheria-sub-master"
 main = "worker.js"
 compatibility_date = "2026-08-19"
-workers_dev = false
+workers_dev = true
 
 # 环境变量占位（实际值在 Dashboard 配置，覆盖此处）
 [vars]
