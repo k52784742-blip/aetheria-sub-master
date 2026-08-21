@@ -1,0 +1,48 @@
+name: Deploy Worker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Write wrangler.toml
+        run: |
+          cat > wrangler.toml <<EOF
+          name = "aetheria-sub-master"
+          main = "worker.js"
+          compatibility_date = "2026-08-19"
+          workers_dev = false
+
+          [vars]
+          ADMIN_BOT_TOKEN = "${{ secrets.ADMIN_BOT_TOKEN }}"
+          STORE_BOT_TOKEN = "${{ secrets.STORE_BOT_TOKEN }}"
+          ADMIN_ID = "${{ secrets.ADMIN_ID }}"
+          DEFAULT_UPSTREAM_URL = "${{ secrets.DEFAULT_UPSTREAM_URL }}"
+
+          [triggers]
+          crons = ["0 0 * * *", "0 8 * * *"]
+
+          [[kv_namespaces]]
+          binding = "SUB_STORE"
+          id = "${{ secrets.KV_NAMESPACE_ID }}"
+          EOF
+
+      - name: Deploy
+        run: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
