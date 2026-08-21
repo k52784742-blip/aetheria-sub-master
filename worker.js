@@ -2939,6 +2939,140 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
+    // ===== 命令参数交互式引导（发命令 → Bot 引导 → 输入参数） =====
+    // /nodeoff /nodeon 无参数
+    if (state("node_toggle")) {
+      const input = text.trim();
+      const parts = input.split(/\s+/);
+      const arg = parts[0];
+      const upIdx = (parts[1] ? parseInt(parts[1]) : 1) - 1;
+      const action = actionState.action;
+      await env.SUB_STORE.delete("admin_action_state");
+      if (arg !== "all" && !/^[\d,\s]+$/.test(arg)) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, `❌ 无效输入\n\n请发送节点序号，例如：\n\`1,3,5\` 或 \`all\`\n（可空格跟上游序号，如 \`1,3,5 2\`）`, MAIN_MENU);
+        return new Response("OK");
+      }
+      const r = await batchToggleNodes(env, action, arg === "all" ? "all" : arg, upIdx);
+      if (!r.ok) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, `❌ ${r.msg}`, MAIN_MENU);
+      } else {
+        const hostPreview = r.affected.slice(0, 3).map(h => h.slice(0, 30)).join("\n");
+        await sendMenu(ADMIN_BOT_TOKEN, chatId,
+          `${action === "off" ? "🔴【批量禁用完成】" : "🟢【批量启用完成】"}\n\n• ${action === "off" ? "禁用" : "启用"}: ${r.done} 个\n• ${action === "off" ? "已禁用跳过" : "未禁用跳过"}: ${r.skipped} 个\n${hostPreview ? `\n${hostPreview}${r.affected.length > 3 ? "\n..." : ""}` : ""}\n\n买家订阅将${action === "off" ? "不再下发这些节点。" : "恢复这些节点。"}`,
+          MAIN_MENU);
+      }
+      return new Response("OK");
+    }
+
+    // /check 无参数
+    if (state("check_input")) {
+      const target = text.trim();
+      await env.SUB_STORE.delete("admin_action_state");
+      if (!target) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 输入无效，请输入 UID 或 ChatID", MAIN_MENU);
+        return new Response("OK");
+      }
+      let targetUid = target;
+      let userDataStr = await env.SUB_STORE.get(`user_${targetUid}`);
+      if (!userDataStr) {
+        const targetChatId = parseInt(target.replace("@", ""));
+        if (!isNaN(targetChatId)) {
+          const uidByChat = await findUidByChatId(env, targetChatId);
+          if (uidByChat) {
+            targetUid = uidByChat;
+            userDataStr = await env.SUB_STORE.get(`user_${uidByChat}`);
+          }
+        }
+      }
+      if (!userDataStr) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, `❌ 数据库未找到 UID/ChatID: ${target}`, MAIN_MENU);
+      } else {
+        const u = JSON.parse(userDataStr);
+        const { remainDays, stateDesc } = userSummary(u, targetUid);
+        const origin = new URL(request.url).origin;
+        const upStatus = u.upstreamUrl ? `🎯 已指定:\n${u.upstreamUrl.slice(0, 50)}` : "🔄 自动分配";
+        await sendMenu(ADMIN_BOT_TOKEN, chatId,
+          `📊 【用户档案: ${targetUid}】\n• 状态: ${stateDesc}\n• 剩余: ${Math.max(0, remainDays)} 天\n• 到期: ${new Date(u.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n• ChatID: ${u.chatId || "-"}\n${u.note ? `• 备注: ${u.note}\n` : ""}• 上游: ${upStatus}\n• 短链: ${origin}/s/${targetUid}`,
+          {
+            inline_keyboard: [
+              [
+                { text: "🔴 禁用", callback_data: `disable_${targetUid}` },
+                { text: "🟢 开启", callback_data: `enable_${targetUid}` },
+                { text: "🗑️ 删除", callback_data: `del_${targetUid}` }
+              ],
+              [
+                { text: "🎯 分配上游", callback_data: `assign_${targetUid}` },
+                { text: "↩️ 撤销删除", callback_data: `undel_${targetUid}` }
+              ]
+            ]
+          });
+      }
+      return new Response("OK");
+    }
+
+    // /addurl /setup 无参数
+    if (state("addurl")) {
+      const url = text.trim();
+      await env.SUB_STORE.delete("admin_action_state");
+      if (!url.startsWith("http")) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 链接必须以 http/https 开头", MAIN_MENU);
+      } else {
+        const r = await addUpstream(env, url, `上游${(await getUpstreamPool(env)).length + 1}`);
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, r.ok ? `✅ ${r.msg}${r.isDefault ? "（已设为默认）" : ""}` : `❌ ${r.msg}`, MAIN_MENU);
+      }
+      return new Response("OK");
+    }
+
+    // /delurl 无参数
+    if (state("delurl")) {
+      const idx = parseInt(text.trim()) - 1;
+      await env.SUB_STORE.delete("admin_action_state");
+      const r = await removeUpstream(env, idx);
+      await sendMenu(ADMIN_BOT_TOKEN, chatId, r.ok ? `✅ ${r.msg}` : `❌ ${r.msg}`, MAIN_MENU);
+      return new Response("OK");
+    }
+
+    // /setdef 无参数
+    if (state("setdef")) {
+      const idx = parseInt(text.trim()) - 1;
+      await env.SUB_STORE.delete("admin_action_state");
+      const r = await setDefaultUpstream(env, idx);
+      await sendMenu(ADMIN_BOT_TOKEN, chatId, r.ok ? `✅ ${r.msg}` : `❌ ${r.msg}`, MAIN_MENU);
+      return new Response("OK");
+    }
+
+    // /noteurl 无参数
+    if (state("noteurl")) {
+      const parts = text.trim().split(/\s+/);
+      const idx = parseInt(parts[0]) - 1;
+      const note = parts.slice(1).join(" ");
+      const pool = await getUpstreamPool(env);
+      await env.SUB_STORE.delete("admin_action_state");
+      if (idx < 0 || idx >= pool.length || !note) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 格式：序号 备注\n例如：1 日本节点", MAIN_MENU);
+      } else {
+        pool[idx].note = note;
+        await saveUpstreamPool(env, pool);
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, `✅ 已设置备注: ${note}`, MAIN_MENU);
+      }
+      return new Response("OK");
+    }
+
+    // /service 无参数
+    if (state("service")) {
+      const contact = text.trim();
+      await env.SUB_STORE.delete("admin_action_state");
+      if (!contact) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 输入无效，请输入客服联系方式（如 @用户名 或 https://t.me/用户名）", MAIN_MENU);
+      } else {
+        await env.SUB_STORE.put("service_contact", contact);
+        await sendMenu(ADMIN_BOT_TOKEN, chatId,
+          `✅ 【客服已设置】\n\n客服联系方式: ${contact}\n\n买家在前台 Bot 点【📞 联系客服】即可一键联系！`,
+          MAIN_MENU);
+      }
+      return new Response("OK");
+    }
+
     // ===== 菜单按钮处理 =====
     if (text === "➕ 手动开卡") {
       await sendMenu(ADMIN_BOT_TOKEN, chatId, "➕ 【手动开卡】\n请选择开通时长：", daysBtns("newuser_days"));
@@ -2952,6 +3086,13 @@ async function handleAdminBot(request, env) {
     }
 
     // /assign 命令
+    // /assign 无参数 → 交互引导输入 UID
+    if (text === "/assign") {
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "assign_uid", chatId }));
+      await sendMenu(ADMIN_BOT_TOKEN, chatId, "🎯 【分配上游】\n请输入要分配的用户 UID：", CANCEL_BTN);
+      return new Response("OK");
+    }
+
     if (text.startsWith("/assign ")) {
       const parts = text.replace("/assign ", "").trim().split(/\s+/);
       const targetUid = parts[0];
@@ -3197,6 +3338,15 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
+    // /service 无参数 → 交互引导
+    if (text === "/service") {
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "service", chatId }));
+      await sendMenu(ADMIN_BOT_TOKEN, chatId,
+        `📞 【设置客服】\n当前: ${(await env.SUB_STORE.get("service_contact")) || "未设置"}\n\n请发送客服联系方式（@用户名 或 https://t.me/用户名）：`,
+        CANCEL_BTN);
+      return new Response("OK");
+    }
+
     if (text.startsWith("/service ")) {
       const contact = text.replace("/service ", "").trim();
       if (!contact) {
@@ -3227,6 +3377,13 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
+    // /addurl 无参数 → 交互引导
+    if (text === "/addurl") {
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "addurl", chatId }));
+      await sendMenu(ADMIN_BOT_TOKEN, chatId, "🔗 【添加】\n请发送上游订阅链接（http/https 开头）：", CANCEL_BTN);
+      return new Response("OK");
+    }
+
     if (text.startsWith("/addurl ")) {
       const url = text.replace("/addurl ", "").trim();
       if (!url.startsWith("http")) {
@@ -3235,6 +3392,29 @@ async function handleAdminBot(request, env) {
         const r = await addUpstream(env, url, `上游${(await getUpstreamPool(env)).length + 1}`);
         await sendMenu(ADMIN_BOT_TOKEN, chatId, r.ok ? `✅ ${r.msg}${r.isDefault ? "（已设为默认）" : ""}` : `❌ ${r.msg}`, MAIN_MENU);
       }
+      return new Response("OK");
+    }
+
+    // /delurl /setdef /noteurl 无参数 → 显示上游列表 + 交互输入序号
+    if (text === "/delurl" || text === "/setdef" || text === "/noteurl") {
+      const pool = await getUpstreamPool(env);
+      if (pool.length === 0) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有上游，先用 /addurl 添加", MAIN_MENU);
+        return new Response("OK");
+      }
+      let msg = "🔗 【上游列表】\n";
+      pool.forEach((u, i) => { msg += `${i + 1}. ${u.note || "上游" + (i + 1)} ${u.isDefault ? "⭐默认" : ""}\n`; });
+      if (text === "/delurl") {
+        await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "delurl", chatId }));
+        msg += `\n请发送要删除的序号：`;
+      } else if (text === "/setdef") {
+        await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "setdef", chatId }));
+        msg += `\n请发送要设为默认的序号：`;
+      } else {
+        await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "noteurl", chatId }));
+        msg += `\n请发送：序号 备注\n例如：1 日本节点`;
+      }
+      await sendMenu(ADMIN_BOT_TOKEN, chatId, msg, CANCEL_BTN);
       return new Response("OK");
     }
 
@@ -3322,6 +3502,16 @@ async function handleAdminBot(request, env) {
           MAIN_MENU);
       }
     };
+
+    // /nodeoff /nodeon 无参数 → 交互引导输入
+    if (text === "/nodeoff" || text === "/nodeon") {
+      const action = text === "/nodeoff" ? "off" : "on";
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "node_toggle", action, chatId }));
+      await sendMenu(ADMIN_BOT_TOKEN, chatId,
+        `${action === "off" ? "🔴【禁用节点】" : "🟢【启用节点】"}\n请发送节点序号（可先 /nodes 查看）：\n\n例：\`1,3,5\` 或 \`all\`\n（可空格跟上游序号，如 \`1,3,5 2\`）`,
+        CANCEL_BTN);
+      return new Response("OK");
+    }
 
     if (text.startsWith("/nodeoff ")) {
       await nodeToggleHandler("off");
@@ -3711,6 +3901,13 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
+    // /setup 无参数 → 交互引导输入链接
+    if (text === "/setup") {
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "addurl", chatId }));
+      await sendMenu(ADMIN_BOT_TOKEN, chatId, "🔗 【设置上游】\n请发送上游订阅链接（http/https 开头）：", CANCEL_BTN);
+      return new Response("OK");
+    }
+
     if (text.startsWith("/setup ")) {
       const upstream = text.replace("/setup ", "").trim();
       const r = await addUpstream(env, upstream, "手动设置");
@@ -3719,6 +3916,21 @@ async function handleAdminBot(request, env) {
       } else {
         await sendMenu(ADMIN_BOT_TOKEN, chatId, `❌ ${r.msg}\n如需更换请使用 /addurl 添加`, MAIN_MENU);
       }
+      return new Response("OK");
+    }
+
+    // /price /days 无参数 → 复用现有交互
+    if (text === "/price") {
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "set_price", chatId }));
+      await sendMenu(ADMIN_BOT_TOKEN, chatId,
+        `💰 【设置套餐价格】\n当前: ${(await env.SUB_STORE.get("price_info")) || "未设置"}\n\n请直接发送价格内容（如：30元/月）：`,
+        CANCEL_BTN);
+      return new Response("OK");
+    }
+    if (text === "/days") {
+      await sendMenu(ADMIN_BOT_TOKEN, chatId,
+        `📅 【设置默认时长】\n当前: ${(await env.SUB_STORE.get("default_days")) || DEFAULT_DAYS} 天\n\n请选择或输入天数：`,
+        daysBtns("setdays"));
       return new Response("OK");
     }
 
@@ -3782,6 +3994,13 @@ async function handleAdminBot(request, env) {
     }
 
     // /check 查用户
+    // /check 无参数 → 交互引导输入 UID/ChatID
+    if (text === "/check") {
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "check_input", chatId }));
+      await sendMenu(ADMIN_BOT_TOKEN, chatId, "📊 【查用户】\n请输入 UID 或 ChatID：", CANCEL_BTN);
+      return new Response("OK");
+    }
+
     if (text.startsWith("/check ")) {
       const target = text.replace("/check ", "").trim();
       let targetUid = target;
