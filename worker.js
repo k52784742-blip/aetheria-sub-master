@@ -1672,6 +1672,12 @@ async function handleStoreBot(request, env) {
           STORE_MENU);
         return new Response("OK");
       }
+      if (text.startsWith("/")) {
+        await sendMenu(STORE_BOT_TOKEN, chatId,
+          "❓ 未识别的命令，请使用下方菜单操作：\n🛒 购买套餐 / 🔍 查询订阅 / 🎫 兑换卡密 / 📞 联系客服",
+          STORE_MENU);
+        return new Response("OK");
+      }
       await sendMenu(STORE_BOT_TOKEN, chatId,
         `💬 收到您的消息！\n\n如需帮助请使用下方菜单：\n🛒 购买套餐 / 🔍 查询订阅 / 🎫 兑换卡密 / 📞 联系客服\n\n📌 温馨提示：付款成功后，请直接发送【转账截图/付款凭证图片】，系统会自动提交审核。`,
         STORE_MENU);
@@ -3058,6 +3064,15 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
+    // /qrdel 无参数 → 交互输入序号删除收款码
+    if (state("qrdel")) {
+      const idx = parseInt(text.trim()) - 1;
+      await env.SUB_STORE.delete("admin_action_state");
+      const r = await removePaymentQR(env, idx);
+      await sendMenu(ADMIN_BOT_TOKEN, chatId, r.ok ? `✅ ${r.msg}` : `❌ ${r.msg}`, MAIN_MENU);
+      return new Response("OK");
+    }
+
     // /service 无参数
     if (state("service")) {
       const contact = text.trim();
@@ -3646,7 +3661,7 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    if (text === "➕ 生成卡密") {
+    if (text === "➕ 生成卡密" || text === "/gencard") {
       await sendMenu(ADMIN_BOT_TOKEN, chatId, `➕ 【生成卡密】\n请选择生成数量：`, {
         inline_keyboard: [
           [{ text: "5 张", callback_data: "gencard_qty_5" }, { text: "10 张", callback_data: "gencard_qty_10" }],
@@ -3894,7 +3909,22 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    if (text.startsWith("/qrdel")) {
+    // /qrdel 无参数 → 显示收款码列表 + 引导输入序号
+    if (text === "/qrdel") {
+      const list = await getPaymentQRs(env);
+      if (list.length === 0) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有收款码\n发送 /setqr 后上传即可添加", MAIN_MENU);
+      } else {
+        let msg = `🖼️ 【删除收款码】\n当前 ${list.length} 张：\n\n`;
+        list.forEach((q, i) => { msg += `${i + 1}. ${q.note || "收款码"}\n`; });
+        msg += `\n请发送要删除的序号：`;
+        await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "qrdel", chatId }));
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, msg, CANCEL_BTN);
+      }
+      return new Response("OK");
+    }
+
+    if (text.startsWith("/qrdel ")) {
       const idx = parseInt(text.replace("/qrdel", "").trim()) - 1;
       const r = await removePaymentQR(env, idx);
       await sendMenu(ADMIN_BOT_TOKEN, chatId, r.ok ? `✅ ${r.msg}` : `❌ ${r.msg}`, MAIN_MENU);
@@ -4041,8 +4071,14 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // 默认兜底
-    await sendMenu(ADMIN_BOT_TOKEN, chatId, "收到指令。如需帮助请点击下方菜单或发送 /start", MAIN_MENU);
+    // 默认兜底：识别未支持的斜杠命令，其余引导到菜单
+    if (text.startsWith("/")) {
+      await sendMenu(ADMIN_BOT_TOKEN, chatId,
+        `❓ 未识别的命令 \`${text.split(" ")[0]}\`\n\n发送 /start 查看帮助，或使用下方菜单操作。`,
+        MAIN_MENU);
+    } else {
+      await sendMenu(ADMIN_BOT_TOKEN, chatId, "收到指令。如需帮助请点击下方菜单或发送 /start", MAIN_MENU);
+    }
     return new Response("OK");
   } catch (err) {
     return new Response("OK");
