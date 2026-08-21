@@ -1,0 +1,24 @@
+# ==================== 部署配置（Git 集成专用，随仓库提交）====================
+# 注意：本文件仅含非敏感配置，真实 Token/变量一律在 Cloudflare Dashboard
+# 的「Settings → Variables and Secrets」中配置（优先级高于本文件的 [vars]）。
+
+name = "aetheria-sub-master"
+main = "worker.js"
+compatibility_date = "2026-08-19"
+workers_dev = false
+
+# 环境变量占位（实际值在 Dashboard 配置，覆盖此处）
+[vars]
+ADMIN_BOT_TOKEN = "SET_IN_DASHBOARD"
+STORE_BOT_TOKEN = "SET_IN_DASHBOARD"
+ADMIN_ID = "SET_IN_DASHBOARD"
+DEFAULT_UPSTREAM_URL = "SET_IN_DASHBOARD"
+
+# 定时触发器（到期自动提醒 + 每日日报）
+[triggers]
+crons = ["0 0 * * *", "0 8 * * *"]
+
+# KV 绑定（id 从 Cloudflare Dashboard → Workers & Pages → KV → SUB_STORE 复制）
+[[kv_namespaces]]
+binding = "SUB_STORE"
+id = "87ae5157747f4cc1a98509e006787695"
