@@ -86,7 +86,8 @@ const STORE_MENU = {
   keyboard: [
     [{ text: "🛒 购买套餐" }, { text: "🔍 查询订阅" }],
     [{ text: "🎫 兑换卡密" }, { text: "🎁 优惠券" }],
-    [{ text: "❓ 常见问题" }, { text: "📞 联系客服" }]
+    [{ text: "📋 我的订单" }, { text: "❓ 常见问题" }],
+    [{ text: "📞 联系客服" }]
   ],
   resize_keyboard: true,
   persistent: true
@@ -95,13 +96,21 @@ const STORE_MENU = {
 const MAIN_MENU = {
   keyboard: [
     [{ text: "➕ 手动开卡" }, { text: "📋 用户列表" }],
-    [{ text: "🔎 搜索用户" }, { text: "📊 用户统计" }],
-    [{ text: "⏳ 即将到期" }, { text: "📤 导出名单" }],
+    [{ text: "🔍 搜索用户" }, { text: "⏳ 即将到期" }],
     [{ text: "📦 订单管理" }, { text: "🎫 卡密管理" }],
-    [{ text: "📦 套餐管理" }, { text: "⚙️ 系统设置" }],
+    [{ text: "🧩 套餐管理" }, { text: "📊 系统概览" }],
+    [{ text: "⚙️ 更多功能" }]
+  ],
+  resize_keyboard: true,
+  persistent: true
+};
+
+const MORE_MENU = {
+  keyboard: [
+    [{ text: "📈 用户统计" }, { text: "📤 导出名单" }],
     [{ text: "💰 分销系统" }, { text: "📣 群发通知" }],
-    [{ text: "📊 系统概览" }, { text: "📜 操作日志" }],
-    [{ text: "❓ 帮助说明" }]
+    [{ text: "📜 操作日志" }, { text: "🧰 系统设置" }],
+    [{ text: "❓ 帮助说明" }, { text: "🏠 返回主菜单" }]
   ],
   resize_keyboard: true,
   persistent: true
@@ -957,7 +966,33 @@ async function sendPendingOrders(env, chatId, page, messageId) {
   }
 }
 
-// ==================== 每日运营日报 ====================
+// 买家：我的订单
+async function sendMyOrders(env, chatId) {
+  const orderKeys = await listAllKeys(env, "pending_", 2000);
+  const mine = [];
+  for (const k of orderKeys) {
+    try {
+      const o = JSON.parse(await env.SUB_STORE.get(k));
+      if (o.chatId === chatId) mine.push(o);
+    } catch (e) {}
+  }
+  mine.sort((a, b) => (b.time || 0) - (a.time || 0));
+  if (mine.length === 0) {
+    await sendMenu(STORE_BOT_TOKEN, chatId, "📋 您当前没有进行中的订单。\n\n点【🛒 购买套餐】开始！", STORE_MENU);
+    return;
+  }
+  let msg = `📋 【我的订单】(${mine.length} 笔)\n\n`;
+  const rows = [];
+  mine.forEach(o => {
+    const status = o.proofTime ? "⏳ 待审核" : "🟡 待付款";
+    const methodLabel = (o.paymentMethod && o.paymentMethod !== "default") ? payMethodLabel(o.paymentMethod) : "默认";
+    const timeStr = new Date(o.time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+    msg += `• \`${o.orderId}\` ${status}\n  ${o.planName || "套餐"} (${o.planDays || "?"}天 / ${o.planPrice || "?"}) · ${methodLabel}\n  ${timeStr}\n\n`;
+    rows.push([{ text: `❌ 取消订单`, callback_data: `cancel_order_${o.orderId}` }]);
+  });
+  msg += `🟡 待付款 = 请尽快完成支付并发送截图\n⏳ 待审核 = 已提交截图，等待管理员确认\n\n如需取消订单，点击下方按钮。`;
+  await sendMenu(STORE_BOT_TOKEN, chatId, msg, { inline_keyboard: rows });
+}
 async function sendDailyReport(env) {
   try {
     const recordKeys = await listAllKeys(env, "record_", 5000);
@@ -1785,6 +1820,12 @@ async function handleStoreBot(request, env) {
       return new Response("OK");
     }
 
+    // 我的订单
+    if (text === "📋 我的订单") {
+      await sendMyOrders(env, chatId);
+      return new Response("OK");
+    }
+
     // 常见问题
     if (text === "❓ 常见问题") {
       const price = (await env.SUB_STORE.get("price_info")) || "联系客服获取";
@@ -1911,12 +1952,12 @@ async function handleStoreBot(request, env) {
       }
       if (text.startsWith("/")) {
         await sendMenu(STORE_BOT_TOKEN, chatId,
-          "❓ 未识别的命令，请使用下方菜单操作：\n🛒 购买套餐 / 🔍 查询订阅 / 🎫 兑换卡密 / 📞 联系客服",
+          "❓ 未识别的命令，请使用下方菜单操作：\n🛒 购买套餐 / 🔍 查询订阅 / 🎫 兑换卡密 / 📋 我的订单 / 📞 联系客服",
           STORE_MENU);
         return new Response("OK");
       }
       await sendMenu(STORE_BOT_TOKEN, chatId,
-        `💬 收到您的消息！\n\n如需帮助请使用下方菜单：\n🛒 购买套餐 / 🔍 查询订阅 / 🎫 兑换卡密 / 📞 联系客服\n\n📌 温馨提示：付款成功后，请直接发送【转账截图/付款凭证图片】，系统会自动提交审核。`,
+        `💬 收到您的消息！\n\n如需帮助请使用下方菜单：\n🛒 购买套餐 / 🔍 查询订阅 / 🎫 兑换卡密 / 📋 我的订单 / 📞 联系客服\n\n📌 温馨提示：付款成功后，请直接发送【转账截图/付款凭证图片】，系统会自动提交审核。`,
         STORE_MENU);
       return new Response("OK");
     }
@@ -1947,6 +1988,7 @@ async function handleStoreBot(request, env) {
     // 买家提交凭证后刷新订单 TTL，避免管理员稍后处理时订单已过期
     if (orderInfo) {
       try {
+        orderInfo.proofTime = Date.now();
         await env.SUB_STORE.put(`pending_${orderInfo.orderId}`, JSON.stringify(orderInfo), { expirationTtl: 86400 });
       } catch (e) {}
     }
@@ -3586,13 +3628,13 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    if (text === "🔎 搜索用户") {
+    if (text === "🔍 搜索用户" || text === "🔎 搜索用户") {
       await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "search_user", chatId }));
       await sendMenu(ADMIN_BOT_TOKEN, chatId, "🔎 【搜索用户】\n请输入关键词（按备注/套餐/UID 搜索）：\n例如：VIP、月卡、1234", CANCEL_BTN);
       return new Response("OK");
     }
 
-    if (text === "📊 用户统计") {
+    if (text === "📈 用户统计" || text === "📊 用户统计") {
       const userKeys = await listAllKeys(env, "user_", 10000);
       let active = 0, expired = 0, disabled = 0;
       const expiringSoon = [];
@@ -3762,7 +3804,12 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    if (text === "⚙️ 系统设置") {
+    if (text === "⚙️ 更多功能") {
+      await sendMenu(ADMIN_BOT_TOKEN, chatId, "⚙️ 【更多功能】\n请选择功能：", MORE_MENU);
+      return new Response("OK");
+    }
+
+    if (text === "🧰 系统设置" || text === "⚙️ 系统设置") {
       await sendMenu(ADMIN_BOT_TOKEN, chatId, "⚙️ 【系统设置】\n请选择要设置的项目：", {
         keyboard: [
           [{ text: "🔗 上游池管理" }, { text: "📦 套餐管理" }],
@@ -3853,7 +3900,7 @@ async function handleAdminBot(request, env) {
     }
 
     // ===== 套餐管理入口 =====
-    if (text === "📦 套餐管理" || text === "/plans") {
+    if (text === "🧩 套餐管理" || text === "📦 套餐管理" || text === "/plans") {
       await showPlanManage(env, chatId);
       return new Response("OK");
     }
@@ -4356,11 +4403,12 @@ async function handleAdminBot(request, env) {
     // 帮助说明
     if (text === "❓ 帮助说明" || text === "/start") {
       const helpMsg = `👑 【AETHERIA 管理中枢使用指南】\n\n` +
+                      `**🗂 菜单说明**\n主菜单：高频操作一键直达\n⚙️ 更多功能：用户统计/导出名单/分销/群发/操作日志/系统设置/帮助\n\n` +
                       `**👥 用户管理**\n- 用户列表：查看所有用户及状态\n- 查找用户：/check UID 或 /check ChatID\n- 用户统计：活跃/过期/禁用分布\n- 即将到期：7天内到期用户\n- 手动开卡：为指定 ChatID 开通\n- 调整时长：给用户加/减天数\n- 用户备注：给用户打标签\n- 私信用户：一对一给用户发消息\n- 导出名单：导出全部用户信息\n\n` +
                       `**📦 套餐管理**\n- 增删改/启停套餐，买家只看到在售套餐\n- 按钮操作，无需记命令\n\n` +
                       `**🎫 卡密管理**\n- 生成卡密：/gencard 数量 天数 价格\n- 买家自助兑换，无需审核\n- 卡密统计/查询/清理\n\n` +
                       `**📦 订单管理**\n- 待审核：查看付款凭证\n- 已处理：处理记录\n- 收款流水：订单流水与金额统计\n- 发货：凭证下方点【确认到账】\n\n` +
-                      `**⚙️ 系统设置**\n- 上游池：/addurl 链接 添加（可无限加）\n- 管理上游：/listurl /delurl /setdef\n- 合并节点：/merge on 合并所有上游节点\n- 节点管理：/nodes 查看 /nodeoff 禁用 /nodeon 启用\n- 支付方式：💳 支付方式 配置微信/支付宝/USDT\n- 价格/时长/客服：⚙️ 系统设置 内按钮化\n- 公告：📢 发布公告\n\n` +
+                      `**🧰 系统设置**（⚙️ 更多功能 内）\n- 上游池：/addurl 链接 添加（可无限加）\n- 管理上游：/listurl /delurl /setdef\n- 合并节点：/merge on 合并所有上游节点\n- 节点管理：/nodes 查看 /nodeoff 禁用 /nodeon 启用\n- 支付方式：💳 支付方式 配置微信/支付宝/USDT\n- 价格/时长/客服：🧰 系统设置 内按钮化\n- 公告：📢 发布公告\n\n` +
                       `**📣 群发通知**\n- 给所有用户发消息\n\n` +
                       `**💰 分销系统**\n- 创建分销商（自动生成推广链接）\n- 设置佣金比例\n- 查看推广点击与佣金\n- 删除分销商\n\n` +
                       `**📊 系统概览**\n- 用户/订单/卡密/套餐/流水全统计\n\n` +
