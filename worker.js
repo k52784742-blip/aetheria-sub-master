@@ -786,6 +786,26 @@ async function saveUsdtInfo(env, address, network) {
   await env.SUB_STORE.put("pay_usdt", JSON.stringify({ address, network: network || "TRC20", updatedAt: Date.now() }));
 }
 
+// USDT 汇率（1 USDT = N 人民币），未配置默认 7.2
+async function getUsdtRate(env) {
+  const str = await env.SUB_STORE.get("usdt_rate");
+  if (str) {
+    const r = parseFloat(str);
+    if (r > 0) return r;
+  }
+  return 7.2;
+}
+
+async function saveUsdtRate(env, rate) {
+  await env.SUB_STORE.put("usdt_rate", String(rate));
+}
+
+// 人民币金额 → USDT 金额（向上取整到 2 位小数，避免少收）
+function cnyToUsdt(cny, rate) {
+  if (!cny || cny <= 0) return null;
+  return Math.ceil((cny / rate) * 100) / 100;
+}
+
 // 获取买家可见的可用支付方式列表
 async function getAvailablePayMethods(env) {
   const methods = [];
@@ -1529,9 +1549,22 @@ async function sendOrderPayInfo(env, chatId, plan, method) {
       await sendMenu(STORE_BOT_TOKEN, chatId, "⚠️ USDT 支付未配置，请联系管理员。", STORE_MENU);
       return null;
     }
+    const rate = await getUsdtRate(env);
+    const cnyPrice = extractAmount(plan.price);
+    const usdtAmount = cnyToUsdt(cnyPrice, rate);
     await sendMenu(STORE_BOT_TOKEN, chatId,
-      `🪙 【USDT 支付】\n\n• 订单编号: \`${orderId}\`\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}\n\n📮 收款地址:\n\`${usdt.address}\`\n\n🌐 网络: ${usdt.network}\n\n📌 请务必使用 ${usdt.network} 网络转账，金额与套餐一致\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付`,
+      `🪙 【USDT 支付】\n\n• 订单编号: \`${orderId}\`\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}${usdtAmount ? ` ≈ **${usdtAmount} USDT**（汇率 1 USDT = ¥${rate}）` : ""}\n\n📮 收款地址:\n\`${usdt.address}\`\n\n🌐 网络: ${usdt.network}\n\n📌 请务必使用 ${usdt.network} 网络转账 **${usdtAmount || "对应"} USDT**，金额与套餐一致\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付`,
       cancelMarkup);
+    await env.SUB_STORE.put(`pending_${orderId}`, JSON.stringify({
+      chatId, orderId, time: Date.now(), type: "new",
+      planId: plan.id, planName: plan.name, planDays: plan.days, planPrice: plan.price,
+      paymentMethod: "usdt", usdtAmount, usdtRate: rate
+    }), { expirationTtl: 1800 });
+    try {
+      await sendText(ADMIN_BOT_TOKEN, ADMIN_ID,
+        `🛒 【新订单生成】\n• 订单号: ${orderId}\n• 套餐: ${plan.name} (${plan.days}天/${plan.price})\n• 支付方式: 🪙 USDT${usdtAmount ? ` ≈ ${usdtAmount} USDT` : ""}\n• 买家 ChatID: ${chatId}\n\n等待买家付款后提交截图…`);
+    } catch (e) {}
+    return orderId;
   } else {
     let qrFileId = method.qrFileId;
     let qrList = null;
@@ -1948,7 +1981,7 @@ async function handleStoreBot(request, env) {
     };
 
     const orderLine = orderInfo
-      ? `• 订单号: ${orderInfo.orderId || "—"}\n• 套餐: ${orderInfo.planName || "默认"} (${orderInfo.planDays || "?"}天 / ${orderInfo.planPrice || "?"})\n${orderInfo.paymentMethod && orderInfo.paymentMethod !== "default" ? `• 支付方式: ${payMethodLabel(orderInfo.paymentMethod)}\n` : ""}`
+      ? `• 订单号: ${orderInfo.orderId || "—"}\n• 套餐: ${orderInfo.planName || "默认"} (${orderInfo.planDays || "?"}天 / ${orderInfo.planPrice || "?"})\n${orderInfo.paymentMethod && orderInfo.paymentMethod !== "default" ? `• 支付方式: ${payMethodLabel(orderInfo.paymentMethod)}${orderInfo.paymentMethod === "usdt" && orderInfo.usdtAmount ? ` ≈ ${orderInfo.usdtAmount} USDT` : ""}\n` : ""}`
       : "";
     await tg(ADMIN_BOT_TOKEN, "sendMessage", {
       chat_id: ADMIN_ID,
@@ -3250,6 +3283,21 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
+    // 设置 USDT 汇率
+    if (state("usdt_rate")) {
+      const rate = parseFloat(text.trim());
+      await env.SUB_STORE.delete("admin_action_state");
+      if (isNaN(rate) || rate <= 0) {
+        await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 汇率无效，请输入大于 0 的数字（如 7.2）", MAIN_MENU);
+      } else {
+        await saveUsdtRate(env, rate);
+        await sendMenu(ADMIN_BOT_TOKEN, chatId,
+          `✅ 【USDT 汇率已设置】\n1 USDT = ¥${rate}\n\n买家选 USDT 付款时，套餐金额将按此汇率折算成 USDT 显示。`,
+          MAIN_MENU);
+      }
+      return new Response("OK");
+    }
+
     // 配置 USDT 地址
     if (state("usdt_address")) {
       const input = text.trim();
@@ -3733,22 +3781,33 @@ async function handleAdminBot(request, env) {
       const wechat = await getPayQrs(env, "wechat");
       const alipay = await getPayQrs(env, "alipay");
       const usdt = await getUsdtInfo(env);
+      const rate = await getUsdtRate(env);
       await sendMenu(ADMIN_BOT_TOKEN, chatId,
         `💳 【支付方式】\n\n` +
         `📱 微信: ${wechat.length > 0 ? `已配置 ${wechat.length} 张收款码 🟢` : "未配置 🔴"}\n` +
         `🧧 支付宝: ${alipay.length > 0 ? `已配置 ${alipay.length} 张收款码 🟢` : "未配置 🔴"}\n` +
-        `🪙 USDT: ${usdt ? `已配置 ${usdt.address.slice(0, 8)}... (${usdt.network}) 🟢` : "未配置 🔴"}\n\n` +
+        `🪙 USDT: ${usdt ? `已配置 ${usdt.address.slice(0, 8)}... (${usdt.network}) 🟢` : "未配置 🔴"}\n` +
+        `💱 USDT 汇率: 1 USDT = ¥${rate}\n\n` +
         `买家购买时可选择已配置的支付方式。`,
         {
           keyboard: [
             [{ text: "📱 配置微信收款码" }, { text: "🧧 配置支付宝收款码" }],
-            [{ text: "🪙 配置 USDT 地址" }],
+            [{ text: "🪙 配置 USDT 地址" }, { text: "💱 设置 USDT 汇率" }],
             [{ text: "📋 查看/删除已配置" }],
             [{ text: "🏠 返回主菜单" }]
           ],
           resize_keyboard: true,
           persistent: true
         });
+      return new Response("OK");
+    }
+
+    if (text === "💱 设置 USDT 汇率") {
+      const rate = await getUsdtRate(env);
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "usdt_rate", chatId }));
+      await sendMenu(ADMIN_BOT_TOKEN, chatId,
+        `💱 【设置 USDT 汇率】\n当前: 1 USDT = ¥${rate}\n\n请输入 1 USDT 兑多少人民币：\n例如：\`7.2\`（表示 1 U = 7.2 元）`,
+        CANCEL_BTN);
       return new Response("OK");
     }
 
