@@ -800,53 +800,6 @@ function payMethodLabel(id) {
   return id === "wechat" ? "📱 微信" : (id === "alipay" ? "🧧 支付宝" : (id === "usdt" ? "🪙 USDT" : id));
 }
 
-// ==================== 收款码 ====================
-async function getPaymentQRs(env) {
-  const listStr = await env.SUB_STORE.get("payment_qrs");
-  if (listStr) {
-    try {
-      const arr = JSON.parse(listStr);
-      if (Array.isArray(arr) && arr.length > 0) return arr;
-    } catch (e) {}
-  }
-  const single = await env.SUB_STORE.get("payment_qr_file_id");
-  if (single) return [{ id: 0, fileId: single, note: "收款码", addedAt: Date.now() }];
-  return [];
-}
-
-async function savePaymentQRs(env, list) {
-  await env.SUB_STORE.put("payment_qrs", JSON.stringify(list));
-  if (list.length > 0) {
-    await env.SUB_STORE.put("payment_qr_file_id", list[0].fileId);
-  } else {
-    await env.SUB_STORE.delete("payment_qr_file_id");
-  }
-}
-
-async function addPaymentQR(env, fileId, note) {
-  const list = await getPaymentQRs(env);
-  list.push({ id: Date.now(), fileId, note: note || `收款码${list.length + 1}`, addedAt: Date.now() });
-  await savePaymentQRs(env, list);
-  return list;
-}
-
-async function removePaymentQR(env, index) {
-  const list = await getPaymentQRs(env);
-  if (isNaN(index) || index < 0 || index >= list.length) return { ok: false, msg: "序号无效" };
-  list.splice(index, 1);
-  await savePaymentQRs(env, list);
-  return { ok: true, msg: `已删除第 ${index + 1} 个收款码` };
-}
-
-const hasPaymentQR = async (env) => (await getPaymentQRs(env)).length > 0;
-
-async function getDisplayQR(env) {
-  const list = await getPaymentQRs(env);
-  if (list.length === 0) return null;
-  if (list.length === 1) return list[0];
-  return list[Math.floor(Math.random() * list.length)];
-}
-
 // 收款码跨 Bot 转换：管理 Bot file_id → 前台 Bot file_id
 async function convertQRForStoreBot(adminFileId) {
   try {
@@ -1123,7 +1076,7 @@ async function buildOverview(env) {
     `📦 套餐: ${plans.length} 个 (${plans.filter(p => p.enabled !== false).length} 个在售)\n` +
     `💰 套餐价格: ${price}\n` +
     `📅 默认时长: ${days} 天\n` +
-    `🖼️ 收款码: ${(await hasPaymentQR(env)) ? "已托管 🟢" : "未托管 🔴"}\n` +
+    `💳 支付方式: ${(await getAvailablePayMethods(env)).length > 0 ? (await getAvailablePayMethods(env)).map(m => m.label).join(" ") : "未配置 🔴"}\n` +
     `🔗 上游池: ${pool.length} 个 (可用 ${activeUp.length})\n` +
     `🔄 合并模式: ${mergeMode ? "✅ 开启" : "⭕ 关闭"}\n` +
     `⚡ 运行环境: Cloudflare Workers (Edge)\n` +
@@ -1585,7 +1538,6 @@ async function sendOrderPayInfo(env, chatId, plan, method) {
     if (!qrFileId) {
       if (method.id === "wechat") qrList = await getPayQrs(env, "wechat");
       else if (method.id === "alipay") qrList = await getPayQrs(env, "alipay");
-      else qrList = await getPaymentQRs(env);
       if (qrList && qrList.length > 0) qrFileId = qrList[Math.floor(Math.random() * qrList.length)].fileId;
     }
     if (!qrFileId) {
@@ -1605,7 +1557,7 @@ async function sendOrderPayInfo(env, chatId, plan, method) {
     });
     const photoJson = await photoRes.json().catch(() => ({}));
     if (!photoJson.ok) {
-      if (qrList && qrList.length > 1 && method.id !== "default") {
+      if (qrList && qrList.length > 1) {
         const newList = qrList.filter(q => q.fileId !== qrFileId);
         await savePayQrs(env, method.id, newList);
         try { await sendText(ADMIN_BOT_TOKEN, ADMIN_ID, `⚠️ ${methodLabel}收款码已失效，已自动移除一张。`); } catch (e) {}
@@ -1618,7 +1570,7 @@ async function sendOrderPayInfo(env, chatId, plan, method) {
   await env.SUB_STORE.put(`pending_${orderId}`, JSON.stringify({
     chatId, orderId, time: Date.now(), type: "new",
     planId: plan.id, planName: plan.name, planDays: plan.days, planPrice: plan.price,
-    paymentMethod: method.id === "default" ? "default" : method.id
+    paymentMethod: method.id
   }), { expirationTtl: 1800 });
 
   try {
@@ -1688,16 +1640,11 @@ async function handleStoreBot(request, env) {
         }
 
         const methods = await getAvailablePayMethods(env);
-        const fallbackQr = await getDisplayQR(env);
-        if (methods.length === 0 && !fallbackQr) {
-          await sendMenu(STORE_BOT_TOKEN, cbChatId, "⚠️ 系统收款方式尚未配置，请联系管理员。", STORE_MENU);
+        if (methods.length === 0) {
+          await sendMenu(STORE_BOT_TOKEN, cbChatId, "⚠️ 系统暂未配置支付方式，请联系管理员。", STORE_MENU);
           return new Response("OK");
         }
 
-        if (methods.length === 0) {
-          await sendOrderPayInfo(env, cbChatId, plan, { id: "default", type: "qr", qrFileId: fallbackQr.fileId });
-          return new Response("OK");
-        }
         if (methods.length === 1) {
           await sendOrderPayInfo(env, cbChatId, plan, methods[0]);
           return new Response("OK");
@@ -1765,20 +1712,18 @@ async function handleStoreBot(request, env) {
       }
 
       const plans = await getActivePlans(env);
-      const qrFileId = (await getDisplayQR(env))?.fileId || null;
-      if (!qrFileId) {
-        await sendMenu(STORE_BOT_TOKEN, chatId, "⚠️ 系统收款码尚未配置，请联系管理员。", STORE_MENU);
+      if (plans.length === 0) {
+        await sendMenu(STORE_BOT_TOKEN, chatId, "⚠️ 当前暂无在售套餐，请稍后再来或联系客服。", STORE_MENU);
+        return new Response("OK");
+      }
+      if ((await getAvailablePayMethods(env)).length === 0) {
+        await sendMenu(STORE_BOT_TOKEN, chatId, "⚠️ 系统暂未配置支付方式，请联系管理员。", STORE_MENU);
         return new Response("OK");
       }
 
       const notice = await env.SUB_STORE.get("notice_content");
       if (notice && text.startsWith("/start")) {
         await sendText(STORE_BOT_TOKEN, chatId, `📢 【公告】\n${notice}`);
-      }
-
-      if (plans.length === 0) {
-        await sendMenu(STORE_BOT_TOKEN, chatId, "⚠️ 当前暂无在售套餐，请稍后再来或联系客服。", STORE_MENU);
-        return new Response("OK");
       }
 
       const planBtns = plans.map(p => [{ text: `📦 ${p.name} (${p.days}天 / ${p.price})`, callback_data: `buyplan_${p.id}` }]);
@@ -1913,21 +1858,6 @@ async function handleStoreBot(request, env) {
       } else {
         await sendMenu(STORE_BOT_TOKEN, chatId, result.msg, STORE_MENU);
       }
-      return new Response("OK");
-    }
-
-    // 管理员直接给前台 Bot 发图 + /setqr（file_id 天然属于前台 Bot）
-    if (msg.photo && (text.includes("/setqr") || text === "🖼️ 设置收款码")) {
-      if (msg.from.id !== ADMIN_ID) {
-        await sendMenu(STORE_BOT_TOKEN, chatId, "❌ 无权限操作", STORE_MENU);
-        return new Response("OK");
-      }
-      const fileId = msg.photo[msg.photo.length - 1].file_id;
-      const list = await addPaymentQR(env, fileId, text.replace("/setqr", "").trim() || undefined);
-      await sendMenu(STORE_BOT_TOKEN, chatId,
-        `✅ 【收款码已收录】第 ${list.length} 张！\n\n当前共 ${list.length} 张收款码，买家购买时随机展示。`,
-        STORE_MENU);
-      try { await sendText(ADMIN_BOT_TOKEN, ADMIN_ID, `✅ 收款码已通过前台 Bot 更新！当前共 ${list.length} 张`); } catch (e) {}
       return new Response("OK");
     }
 
@@ -3542,15 +3472,6 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // /qrdel 无参数 → 交互输入序号删除收款码
-    if (state("qrdel")) {
-      const idx = parseInt(text.trim()) - 1;
-      await env.SUB_STORE.delete("admin_action_state");
-      const r = await removePaymentQR(env, idx);
-      await sendMenu(ADMIN_BOT_TOKEN, chatId, r.ok ? `✅ ${r.msg}` : `❌ ${r.msg}`, MAIN_MENU);
-      return new Response("OK");
-    }
-
     // /service 无参数
     if (state("service")) {
       const contact = text.trim();
@@ -3797,10 +3718,9 @@ async function handleAdminBot(request, env) {
       await sendMenu(ADMIN_BOT_TOKEN, chatId, "⚙️ 【系统设置】\n请选择要设置的项目：", {
         keyboard: [
           [{ text: "🔗 上游池管理" }, { text: "📦 套餐管理" }],
-          [{ text: "🖼️ 设置收款码" }, { text: "💳 支付方式" }],
-          [{ text: "📢 发布公告" }, { text: "💰 设置价格" }],
-          [{ text: "📅 设置时长" }, { text: "📞 设置客服" }],
-          [{ text: "🏠 返回主菜单" }]
+          [{ text: "💳 支付方式" }, { text: "📢 发布公告" }],
+          [{ text: "💰 设置价格" }, { text: "📅 设置时长" }],
+          [{ text: "📞 设置客服" }, { text: "🏠 返回主菜单" }]
         ],
         resize_keyboard: true,
         persistent: true
@@ -4121,18 +4041,6 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    if (text === "🖼️ 设置收款码") {
-      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "setqr", chatId }));
-      await sendMenu(ADMIN_BOT_TOKEN, chatId, "🖼️ 【上传收款码】\n请现在发送收款码图片（无需配文）：\n\n系统收录后将自动清除消息。", CANCEL_BTN);
-      return new Response("OK");
-    }
-
-    if (text === "/setqr") {
-      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "setqr", chatId }));
-      await sendMenu(ADMIN_BOT_TOKEN, chatId, "🖼️ 【上传收款码】\n请现在发送收款码图片（无需配文）：\n\n系统收录后将自动清除消息。", CANCEL_BTN);
-      return new Response("OK");
-    }
-
     if (text === "💰 设置价格") {
       await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "set_price", chatId }));
       await sendMenu(ADMIN_BOT_TOKEN, chatId,
@@ -4393,7 +4301,7 @@ async function handleAdminBot(request, env) {
                       `**📦 套餐管理**\n- 增删改/启停套餐，买家只看到在售套餐\n- 按钮操作，无需记命令\n\n` +
                       `**🎫 卡密管理**\n- 生成卡密：/gencard 数量 天数 价格\n- 买家自助兑换，无需审核\n- 卡密统计/查询/清理\n\n` +
                       `**📦 订单管理**\n- 待审核：查看付款凭证\n- 已处理：处理记录\n- 收款流水：订单流水与金额统计\n- 发货：凭证下方点【确认到账】\n\n` +
-                      `**⚙️ 系统设置**\n- 上游池：/addurl 链接 添加（可无限加）\n- 管理上游：/listurl /delurl /setdef\n- 合并节点：/merge on 合并所有上游节点\n- 节点管理：/nodes 查看 /nodeoff 禁用 /nodeon 启用\n- 收款码：点菜单后发图，自动转换\n- 价格/时长/客服：⚙️ 系统设置 内按钮化\n- 公告：📢 发布公告\n\n` +
+                      `**⚙️ 系统设置**\n- 上游池：/addurl 链接 添加（可无限加）\n- 管理上游：/listurl /delurl /setdef\n- 合并节点：/merge on 合并所有上游节点\n- 节点管理：/nodes 查看 /nodeoff 禁用 /nodeon 启用\n- 支付方式：💳 支付方式 配置微信/支付宝/USDT\n- 价格/时长/客服：⚙️ 系统设置 内按钮化\n- 公告：📢 发布公告\n\n` +
                       `**📣 群发通知**\n- 给所有用户发消息\n\n` +
                       `**💰 分销系统**\n- 创建分销商（自动生成推广链接）\n- 设置佣金比例\n- 查看推广点击与佣金\n- 删除分销商\n\n` +
                       `**📊 系统概览**\n- 用户/订单/卡密/套餐/流水全统计\n\n` +
@@ -4415,9 +4323,9 @@ async function handleAdminBot(request, env) {
     }
 
     // 收款码托管：等待状态下直接收图
-    if (msg.photo && (text.includes("/setqr") || (actionState && ["setqr", "setqr_wechat", "setqr_alipay"].includes(actionState.mode)))) {
+    if (msg.photo && (actionState && ["setqr_wechat", "setqr_alipay"].includes(actionState.mode))) {
       const adminFileId = msg.photo[msg.photo.length - 1].file_id;
-      const currentMode = (actionState && actionState.mode) || "setqr";
+      const currentMode = actionState.mode;
       if (!text.includes("/done")) {
         await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: currentMode, chatId }));
       } else {
@@ -4436,14 +4344,10 @@ async function handleAdminBot(request, env) {
             const list = await addPayQr(env, "wechat", storeFileId);
             listLen = list.length;
             replyMsg = `✅ 【微信收款码已收录】第 ${listLen} 张！\n\n当前共 ${listLen} 张微信收款码${doneText}${continueText}`;
-          } else if (currentMode === "setqr_alipay") {
+          } else {
             const list = await addPayQr(env, "alipay", storeFileId);
             listLen = list.length;
             replyMsg = `✅ 【支付宝收款码已收录】第 ${listLen} 张！\n\n当前共 ${listLen} 张支付宝收款码${doneText}${continueText}`;
-          } else {
-            const list = await addPaymentQR(env, storeFileId, text.replace("/done", "").trim() || undefined);
-            listLen = list.length;
-            replyMsg = `✅ 【收款码已收录】第 ${listLen} 张！\n\n当前共 ${listLen} 张收款码${doneText}${continueText}`;
           }
           await sendMenu(ADMIN_BOT_TOKEN, chatId, replyMsg,
             text.includes("/done") ? MAIN_MENU : { keyboard: [[{ text: "✅ 完成上传" }], [{ text: "🏠 返回主菜单" }]], resize_keyboard: true, persistent: true });
@@ -4458,47 +4362,12 @@ async function handleAdminBot(request, env) {
 
     if (text === "✅ 完成上传" || text === "/done") {
       await env.SUB_STORE.delete("admin_action_state");
-      const list = await getPaymentQRs(env);
+      const wechat = await getPayQrs(env, "wechat");
+      const alipay = await getPayQrs(env, "alipay");
+      const usdt = await getUsdtInfo(env);
       await sendMenu(ADMIN_BOT_TOKEN, chatId,
-        `✅ 【收款码上传完成】\n当前共 ${list.length} 张收款码。\n\n买家购买时将${list.length > 1 ? "随机展示其中一张" : "展示这张"}。\n\n可用 /qrlist 查看，/qrdel 序号 删除。`,
+        `✅ 【支付方式配置完成】\n\n📱 微信: ${wechat.length} 张收款码\n🧧 支付宝: ${alipay.length} 张收款码\n🪙 USDT: ${usdt ? "已配置" : "未配置"}\n\n买家购买时可选已配置的支付方式。`,
         MAIN_MENU);
-      return new Response("OK");
-    }
-
-    if (text === "/qrlist") {
-      const list = await getPaymentQRs(env);
-      if (list.length === 0) {
-        await sendMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有收款码\n发送 /setqr 后上传即可添加", MAIN_MENU);
-      } else {
-        let msg = `🖼️ 【收款码列表】(${list.length} 张)\n\n`;
-        list.forEach((q, i) => {
-          msg += `${i + 1}. ${q.note || "收款码"}\n  添加于 ${new Date(q.addedAt).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n`;
-        });
-        msg += `\n删除：/qrdel 序号`;
-        await sendMenu(ADMIN_BOT_TOKEN, chatId, msg, MAIN_MENU);
-      }
-      return new Response("OK");
-    }
-
-    // /qrdel 无参数 → 显示收款码列表 + 引导输入序号
-    if (text === "/qrdel") {
-      const list = await getPaymentQRs(env);
-      if (list.length === 0) {
-        await sendMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有收款码\n发送 /setqr 后上传即可添加", MAIN_MENU);
-      } else {
-        let msg = `🖼️ 【删除收款码】\n当前 ${list.length} 张：\n\n`;
-        list.forEach((q, i) => { msg += `${i + 1}. ${q.note || "收款码"}\n`; });
-        msg += `\n请发送要删除的序号：`;
-        await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "qrdel", chatId }));
-        await sendMenu(ADMIN_BOT_TOKEN, chatId, msg, CANCEL_BTN);
-      }
-      return new Response("OK");
-    }
-
-    if (text.startsWith("/qrdel ")) {
-      const idx = parseInt(text.replace("/qrdel", "").trim()) - 1;
-      const r = await removePaymentQR(env, idx);
-      await sendMenu(ADMIN_BOT_TOKEN, chatId, r.ok ? `✅ ${r.msg}` : `❌ ${r.msg}`, MAIN_MENU);
       return new Response("OK");
     }
 
@@ -4703,8 +4572,6 @@ async function handleWebhookSetup(request, env) {
       { command: "days", description: "📅 设置时长 /days 数字" },
       { command: "service", description: "📞 设置客服 /service @用户名" },
       { command: "setup", description: "🔗 设上游 /setup 链接" },
-      { command: "qrlist", description: "🖼️ 收款码列表" },
-      { command: "qrdel", description: "🗑️ 删收款码 /qrdel 序号" },
       { command: "cancel", description: "❌ 取消当前操作" }
     ];
 
