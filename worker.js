@@ -848,6 +848,45 @@ function userSummary(u, uid) {
   return { remainDays, stateDesc };
 }
 
+// 卡密列表（分页 + 操作按钮）
+async function sendCardList(env, chatId, page, messageId) {
+  const cardKeys = await listAllKeys(env, "card_", 10000);
+  if (cardKeys.length === 0) {
+    const msg = "📭 当前没有任何卡密\n点击「➕ 生成卡密」或 /gencard 生成";
+    if (messageId) { await editMsg(ADMIN_BOT_TOKEN, chatId, messageId, msg, null); }
+    else await sendMenu(ADMIN_BOT_TOKEN, chatId, msg, MAIN_MENU);
+    return;
+  }
+  const perPage = 8;
+  const totalPages = Math.max(1, Math.ceil(cardKeys.length / perPage));
+  const p = Math.max(1, Math.min(page, totalPages));
+  const pageKeys = cardKeys.slice((p - 1) * perPage, p * perPage);
+  let text = `🎫 【卡密列表】(${cardKeys.length} 张 · 第 ${p}/${totalPages} 页)\n\n`;
+  const rows = [];
+  for (const k of pageKeys) {
+    try {
+      const c = JSON.parse(await env.SUB_STORE.get(k));
+      const icon = c.status === "used" ? "🔵已用" : (c.status === "disabled" ? "🔴禁用" : "🟢未用");
+      text += `• ${c.code} | ${icon} | ${c.days}天\n`;
+      const btns = [{ text: "📋", callback_data: `card_lookup_${c.code}` }];
+      if (c.status === "disabled") btns.push({ text: "🟢启用", callback_data: `enable_card_${c.code}` });
+      else if (c.status !== "used") btns.push({ text: "🔴禁用", callback_data: `disable_card_${c.code}` });
+      btns.push({ text: "🗑️删除", callback_data: `del_card_${c.code}` });
+      rows.push(btns);
+    } catch (e) {}
+  }
+  const nav = [];
+  if (p > 1) nav.push({ text: "◀️ 上一页", callback_data: `card_list_page_${p - 1}` });
+  if (p < totalPages) nav.push({ text: "下一页 ▶️", callback_data: `card_list_page_${p + 1}` });
+  if (nav.length) rows.push(nav);
+  const markup = { inline_keyboard: rows };
+  if (messageId) {
+    await editMsg(ADMIN_BOT_TOKEN, chatId, messageId, text, markup);
+  } else {
+    await sendMenu(ADMIN_BOT_TOKEN, chatId, text, markup);
+  }
+}
+
 // 待审核订单列表（分页 + 处理按钮）
 async function sendPendingOrders(env, chatId, page, messageId) {
   const orderKeys = await listAllKeys(env, "pending_", 2000);
@@ -2211,6 +2250,26 @@ async function handleAdminBot(request, env) {
           replyMarkup = { inline_keyboard: [[{ text: "🔴 禁用", callback_data: `disable_${uid}` }]] };
         } else {
           replyText = `❌ 未找到该用户的删除记录（可能超过24小时）`;
+        }
+      }
+
+      // 卡密列表：翻页
+      else if (data.startsWith("card_list_page_")) {
+        const pg = parseInt(data.replace("card_list_page_", "")) || 1;
+        await sendCardList(env, chatId, pg, cb.message.message_id);
+        replyText = "";
+      }
+
+      // 卡密列表：查看单张详情
+      else if (data.startsWith("card_lookup_")) {
+        const code = data.replace("card_lookup_", "");
+        const str = await env.SUB_STORE.get(`card_${code}`);
+        if (!str) {
+          replyAlert = "❌ 卡密不存在";
+        } else {
+          const c = JSON.parse(str);
+          const statusDesc = c.status === "used" ? `已使用 🔵\n使用人: ${c.usedBy}\n使用时间: ${new Date(c.usedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}` : (c.status === "disabled" ? "已禁用 🔴" : "未使用 🟢");
+          replyText = `🎫 【卡密信息】\n\n• 卡密: \`${c.code}\`\n• 套餐: ${c.planName}\n• 时长: ${c.days} 天\n• 价格: ${c.price || "未设置"}\n• 状态: ${statusDesc}`;
         }
       }
 
@@ -3869,16 +3928,21 @@ async function handleAdminBot(request, env) {
 
     if (text === "🎫 卡密管理") {
       await sendMenu(ADMIN_BOT_TOKEN, chatId,
-        `🎫 【卡密管理】\n\n📋 统计 / 查询 / 清理\n🔍 查询卡密后可一键【禁用/启用/删除】单张卡密（发错的卡密可回收）\n\n批量生成请用左侧命令菜单：\n\`/gencard 数量 天数 价格\`\n\`/gencp 数量 天数 折扣 备注\``,
+        `🎫 【卡密管理】\n\n📋 卡密列表 = 查看全部卡密，可直接禁用/删除/查详情\n🔍 查询卡密 = 输入完整/部分卡密码查单张\n\n批量生成请用左侧命令菜单：\n\`/gencard 数量 天数 价格\`\n\`/gencp 数量 天数 折扣 备注\``,
         {
           keyboard: [
-            [{ text: "📋 卡密统计" }, { text: "🔍 查询卡密" }],
-            [{ text: "🗑️ 清理已用卡密" }],
+            [{ text: "📋 卡密列表" }, { text: "📋 卡密统计" }],
+            [{ text: "🔍 查询卡密" }, { text: "🗑️ 清理已用卡密" }],
             [{ text: "🏠 返回主菜单" }]
           ],
           resize_keyboard: true,
           persistent: true
         });
+      return new Response("OK");
+    }
+
+    if (text === "📋 卡密列表") {
+      await sendCardList(env, chatId, 1);
       return new Response("OK");
     }
 
