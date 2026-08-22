@@ -2182,6 +2182,48 @@ async function handleAdminBot(request, env) {
         }
       }
 
+      // 卡密禁用/启用/删除（须在用户 disable_/enable_/del_ 之前，避免前缀截胡）
+      else if (data.startsWith("disable_card_")) {
+        const code = data.replace("disable_card_", "");
+        const str = await env.SUB_STORE.get(`card_${code}`);
+        if (!str) {
+          replyAlert = "❌ 卡密不存在";
+        } else {
+          const c = JSON.parse(str);
+          if (c.status === "used") {
+            replyAlert = "❌ 该卡密已被使用，无法禁用";
+          } else {
+            c.status = "disabled";
+            await env.SUB_STORE.put(`card_${code}`, JSON.stringify(c));
+            await logAction(env, "禁用卡密", code);
+            replyAlert = `🔴 卡密 ${code} 已禁用，不可再兑换`;
+          }
+        }
+      }
+      else if (data.startsWith("enable_card_")) {
+        const code = data.replace("enable_card_", "");
+        const str = await env.SUB_STORE.get(`card_${code}`);
+        if (!str) {
+          replyAlert = "❌ 卡密不存在";
+        } else {
+          const c = JSON.parse(str);
+          if (c.status === "used") {
+            replyAlert = "❌ 该卡密已被使用，无法启用";
+          } else {
+            c.status = "unused";
+            await env.SUB_STORE.put(`card_${code}`, JSON.stringify(c));
+            await logAction(env, "启用卡密", code);
+            replyAlert = `🟢 卡密 ${code} 已恢复可用`;
+          }
+        }
+      }
+      else if (data.startsWith("del_card_")) {
+        const code = data.replace("del_card_", "");
+        await env.SUB_STORE.delete(`card_${code}`);
+        await logAction(env, "删除卡密", code);
+        replyAlert = `🗑️ 卡密 ${code} 已删除`;
+      }
+
       // 禁用/启用/删除用户
       else if (data.startsWith("disable_") || data.startsWith("enable_") || data.startsWith("del_")) {
         const [action, uid] = data.split("_");
@@ -3034,9 +3076,20 @@ async function handleAdminBot(request, env) {
       if (cardStr) {
         const c = JSON.parse(cardStr);
         const statusDesc = c.status === "used" ? `已使用 🔵\n使用人: ${c.usedBy}\n使用时间: ${new Date(c.usedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}` : (c.status === "disabled" ? "已禁用 🔴" : "未使用 🟢");
+        const btns = [];
+        if (c.status === "used") {
+          btns.push([{ text: "🗑️ 删除此卡密", callback_data: `del_card_${c.code}` }]);
+        } else if (c.status === "disabled") {
+          btns.push([{ text: "🟢 启用此卡密", callback_data: `enable_card_${c.code}` }]);
+        } else {
+          btns.push([
+            { text: "🔴 禁用此卡密", callback_data: `disable_card_${c.code}` },
+            { text: "🗑️ 删除", callback_data: `del_card_${c.code}` }
+          ]);
+        }
         await sendMenu(ADMIN_BOT_TOKEN, chatId,
           `🎫 【卡密信息】\n\n• 卡密: \`${c.code}\`\n• 套餐: ${c.planName}\n• 时长: ${c.days} 天\n• 价格: ${c.price || "未设置"}\n• 状态: ${statusDesc}`,
-          MAIN_MENU);
+          { inline_keyboard: btns });
       } else {
         const matches = [];
         for (const k of await listAllKeys(env, "card_", 10000)) {
@@ -3781,7 +3834,7 @@ async function handleAdminBot(request, env) {
 
     if (text === "🎫 卡密管理") {
       await sendMenu(ADMIN_BOT_TOKEN, chatId,
-        `🎫 【卡密管理】\n\n📋 卡密统计 / 查询 / 清理\n批量生成请用左侧命令菜单：\n\`/gencard 数量 天数 价格\`\n\`/gencp 数量 天数 折扣 备注\``,
+        `🎫 【卡密管理】\n\n📋 统计 / 查询 / 清理\n🔍 查询卡密后可一键【禁用/启用/删除】单张卡密（发错的卡密可回收）\n\n批量生成请用左侧命令菜单：\n\`/gencard 数量 天数 价格\`\n\`/gencp 数量 天数 折扣 备注\``,
         {
           keyboard: [
             [{ text: "📋 卡密统计" }, { text: "🔍 查询卡密" }],
