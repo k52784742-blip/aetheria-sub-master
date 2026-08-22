@@ -820,6 +820,42 @@ function userSummary(u, uid) {
   return { remainDays, stateDesc };
 }
 
+// 待审核订单列表（分页 + 处理按钮）
+async function sendPendingOrders(env, chatId, page, messageId) {
+  const orderKeys = await listAllKeys(env, "pending_", 2000);
+  if (orderKeys.length === 0) {
+    const msg = "📭 当前没有待审核订单";
+    if (messageId) { await editMsg(ADMIN_BOT_TOKEN, chatId, messageId, msg, null); }
+    else await sendMenu(ADMIN_BOT_TOKEN, chatId, msg, MAIN_MENU);
+    return;
+  }
+  const perPage = 8;
+  const totalPages = Math.max(1, Math.ceil(orderKeys.length / perPage));
+  const p = Math.max(1, Math.min(page, totalPages));
+  const pageKeys = orderKeys.slice((p - 1) * perPage, p * perPage);
+  let text = `📦 【待审核订单】(${orderKeys.length} 单 · 第 ${p}/${totalPages} 页)\n\n`;
+  const rows = [];
+  for (const k of pageKeys) {
+    try {
+      const order = JSON.parse(await env.SUB_STORE.get(k));
+      text += `• ${order.orderId || k.replace("pending_", "")} ${order.type === "renew" ? "🔄续费" : "🆕新购"} 买家:${order.chatId}\n  ${order.planName || "默认套餐"} ${order.planPrice || ""}\n`;
+      rows.push([
+        { text: "🟢 开通", callback_data: `approve_${order.chatId}_${order.orderId}` },
+        { text: "🚫 取消订单", callback_data: `cancel_pending_${order.orderId}` }
+      ]);
+    } catch (e) {}
+  }
+  const nav = [];
+  if (p > 1) nav.push({ text: "◀️ 上一页", callback_data: `pending_list_page_${p - 1}` });
+  if (p < totalPages) nav.push({ text: "下一页 ▶️", callback_data: `pending_list_page_${p + 1}` });
+  if (nav.length) rows.push(nav);
+  if (messageId) {
+    await editMsg(ADMIN_BOT_TOKEN, chatId, messageId, text, { inline_keyboard: rows });
+  } else {
+    await sendMenu(ADMIN_BOT_TOKEN, chatId, text, { inline_keyboard: rows });
+  }
+}
+
 // ==================== 每日运营日报 ====================
 async function sendDailyReport(env) {
   try {
@@ -1415,6 +1451,18 @@ async function handleStoreBot(request, env) {
         return new Response("OK");
       }
 
+      // 取消订单（买家取消未付款订单）
+      if (cbData.startsWith("cancel_order_")) {
+        const oid = cbData.replace("cancel_order_", "");
+        await env.SUB_STORE.delete(`pending_${oid}`);
+        try { await delMsg(STORE_BOT_TOKEN, cbChatId, cb.message.message_id); } catch (e) {}
+        try {
+          await sendText(ADMIN_BOT_TOKEN, ADMIN_ID, `🚫 【订单已取消】\n订单号: ${oid}\n买家 ChatID: ${cbChatId}\n\n该订单未付款，已被买家取消。`);
+        } catch (e) {}
+        await answerCb(STORE_BOT_TOKEN, cb.id, "✅ 订单已取消，可重新下单");
+        return new Response("OK");
+      }
+
       // 选择套餐 → 展示收款码
       if (cbData.startsWith("buyplan_")) {
         const planId = cbData.replace("buyplan_", "");
@@ -1458,7 +1506,8 @@ async function handleStoreBot(request, env) {
             chat_id: cbChatId,
             photo: qrFileId,
             caption: `💎 【自助下单结算】\n\n• 订单编号: \`${orderId}\`\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}\n\n📌 请扫描上方二维码完成支付\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付`,
-            parse_mode: "Markdown"
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: [[{ text: "❌ 取消订单", callback_data: `cancel_order_${orderId}` }]] }
           })
         });
         const photoJson = await photoRes.json().catch(() => ({}));
@@ -1743,6 +1792,13 @@ async function handleStoreBot(request, env) {
       }
     } catch (e) {}
 
+    // 买家提交凭证后刷新订单 TTL，避免管理员稍后处理时订单已过期
+    if (orderInfo) {
+      try {
+        await env.SUB_STORE.put(`pending_${orderInfo.orderId}`, JSON.stringify(orderInfo), { expirationTtl: 86400 });
+      } catch (e) {}
+    }
+
     const forwardJson = await tg(STORE_BOT_TOKEN, "forwardMessage", {
       chat_id: ADMIN_ID, from_chat_id: chatId, message_id: msg.message_id
     });
@@ -1763,7 +1819,8 @@ async function handleStoreBot(request, env) {
         orderInfo
           ? [
             { text: "🟢 确认到账 · 一键开通", callback_data: `approve_${chatId}_${orderInfo.orderId}` },
-            { text: "⏳ 稍后处理", callback_data: "later" }
+            { text: "⏳ 稍后处理", callback_data: "later" },
+            { text: "❌ 拒绝", callback_data: `reject_proof_${orderInfo.orderId}_${chatId}` }
           ]
           : [
             { text: "⚠️ 无匹配订单，需人工核实", callback_data: "later" }
@@ -1809,7 +1866,7 @@ async function handleAdminBot(request, env) {
         const rparts = data.replace("approve_renew_", "").split("_");
         const rUid = rparts[0];
         const rChatId = rparts.slice(1).join("_");
-        const renewProcessedKey = `processed_renew_${rUid}_${cb.message.message_id}`;
+        const renewProcessedKey = `processed_renew_${rUid}`;
         if (await env.SUB_STORE.get(renewProcessedKey)) {
           replyAlert = "⚠️ 该续费请求已被处理过了，请勿重复操作！";
         } else {
@@ -1974,7 +2031,34 @@ async function handleAdminBot(request, env) {
         }
       }
       else if (data === "later") {
-        replyText = "⏳ 已标记【稍后处理】\n\n此凭证暂不处理，您可稍后直接点下方【确认到账】按钮。";
+        const origButtons = (cb.message && cb.message.reply_markup && cb.message.reply_markup.inline_keyboard) || [];
+        replyAlert = "⏳ 已标记稍后处理";
+        try {
+          await editMsg(ADMIN_BOT_TOKEN, cb.message.chat.id, cb.message.message_id,
+            `⏳ 【已标记稍后处理】\n此凭证暂不处理，稍后可回来点击按钮继续。`,
+            { inline_keyboard: origButtons });
+        } catch (e) {}
+      }
+
+      // 拒绝付款凭证
+      else if (data.startsWith("reject_proof_")) {
+        const rparts = data.replace("reject_proof_", "").split("_");
+        const rOid = rparts[0];
+        const rBuyer = parseInt(rparts.slice(1).join("_"));
+        await env.SUB_STORE.delete(`pending_${rOid}`);
+        await logAction(env, "拒绝凭证", `订单:${rOid} 买家:${rBuyer}`);
+        if (!isNaN(rBuyer)) {
+          try {
+            await sendText(STORE_BOT_TOKEN, rBuyer,
+              `❌ 【付款凭证未通过审核】\n您的截图不清晰或金额不符，请重新发送清晰的转账截图。\n\n如有疑问请联系客服。`);
+          } catch (e) {}
+        }
+        replyAlert = `❌ 已拒绝买家 [${rBuyer}] 的凭证，已通知重新提交`;
+        try {
+          await editMsg(ADMIN_BOT_TOKEN, cb.message.chat.id, cb.message.message_id,
+            `❌ 【凭证已拒绝】\n订单: ${rOid}\n已通知买家重新提交。`,
+            null);
+        } catch (e) {}
       }
 
       // 撤销删除用户
@@ -2282,21 +2366,6 @@ async function handleAdminBot(request, env) {
         }
       }
 
-      // 待审核订单
-      else if (data === "pending_orders") {
-        const orderKeys = await listAllKeys(env, "pending_", 2000);
-        if (orderKeys.length === 0) {
-          replyAlert = "📭 当前没有待审核订单";
-        } else {
-          let ordersText = `📦 【待审核订单】 (${orderKeys.length})\n\n`;
-          for (const k of orderKeys.slice(0, 20)) {
-            const order = JSON.parse(await env.SUB_STORE.get(k));
-            ordersText += `• ${k.replace("pending_", "")} (${order.type === "renew" ? "续费" : "新购"})\n  买家: ${order.chatId}\n  ${new Date(order.time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}\n`;
-          }
-          replyAlert = ordersText;
-        }
-      }
-
       // 手动开卡：选择天数
       else if (data.startsWith("newuser_days_")) {
         const val = data.replace("newuser_days_", "");
@@ -2473,6 +2542,27 @@ async function handleAdminBot(request, env) {
       // 系统概览
       else if (data === "sys_overview") {
         replyText = await buildOverview(env);
+      }
+
+      // 待审核订单：翻页
+      else if (data.startsWith("pending_list_page_")) {
+        const pg = parseInt(data.replace("pending_list_page_", "")) || 1;
+        await sendPendingOrders(env, chatId, pg, cb.message.message_id);
+        replyText = "";
+      }
+
+      // 待审核订单：管理员取消订单
+      else if (data.startsWith("cancel_pending_")) {
+        const oid = data.replace("cancel_pending_", "");
+        let buyerChat = null;
+        const oStr = await env.SUB_STORE.get(`pending_${oid}`);
+        if (oStr) { try { buyerChat = JSON.parse(oStr).chatId; } catch (e) {} }
+        await env.SUB_STORE.delete(`pending_${oid}`);
+        await logAction(env, "取消订单", `订单:${oid} 买家:${buyerChat || "?"}`);
+        replyAlert = `🚫 订单 ${oid} 已取消`;
+        if (buyerChat) {
+          try { await sendText(STORE_BOT_TOKEN, buyerChat, `❌ 您的订单 ${oid} 已被管理员取消。\n如已付款请联系客服。`); } catch (e) {}
+        }
       }
 
       // ===== 套餐管理回调 =====
@@ -3380,19 +3470,9 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
+    // 待审核订单列表（带处理按钮，每页 8 条）
     if (text === "⏳ 待审核订单") {
-      const orderKeys = await listAllKeys(env, "pending_", 2000);
-      if (orderKeys.length === 0) {
-        await sendMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有待审核订单", MAIN_MENU);
-      } else {
-        let ordersText = `📦 【待审核订单】 (${orderKeys.length})\n\n`;
-        for (const k of orderKeys.slice(0, 20)) {
-          const order = JSON.parse(await env.SUB_STORE.get(k));
-          ordersText += `• ${k.replace("pending_", "")} (${order.type === "renew" ? "续费" : "新购"})\n  买家: ${order.chatId}\n  ${new Date(order.time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}\n`;
-        }
-        await sendMenu(ADMIN_BOT_TOKEN, chatId, ordersText, MAIN_MENU);
-      }
-      return new Response("OK");
+      return await sendPendingOrders(env, chatId, 1);
     }
 
     if (text === "📋 已处理订单") {
