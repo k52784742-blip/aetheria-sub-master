@@ -394,9 +394,18 @@ function extractHostKey(line) {
 
 // 拉取并解析上游节点（base64 自动解码）
 async function fetchUpstreamNodes(env, upstreamUrl) {
-  const res = await fetch(upstreamUrl, {
-    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-  });
+  let res;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000);
+    res = await fetch(upstreamUrl, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+      signal: ctrl.signal
+    });
+    clearTimeout(timer);
+  } catch (e) {
+    return { ok: false, nodes: [], error: "timeout" };
+  }
   if (!res.ok) return { ok: false, nodes: [] };
   let decoded = (await res.text()).trim();
   try {
@@ -744,6 +753,23 @@ async function creditReseller(env, chatId, planPrice) {
     if (commission <= 0) return;
     aff.reseller.commission = (aff.reseller.commission || 0) + commission;
     aff.reseller.orders = (aff.reseller.orders || 0) + 1;
+    await env.SUB_STORE.put(aff.key, JSON.stringify(aff.reseller));
+  } catch (e) {}
+}
+
+// 撤销发货/续费时扣回已记的分销佣金
+async function revokeResellerCredit(env, chatId, planPrice) {
+  try {
+    const aff = await getBuyerAffiliate(env, chatId);
+    if (!aff) return;
+    const parsedRate = parseFloat(await env.SUB_STORE.get("comm_rate"));
+    const rate = Number.isFinite(parsedRate) ? parsedRate : 10;
+    const priceNum = extractAmount(planPrice);
+    if (isNaN(priceNum) || priceNum <= 0) return;
+    const commission = +(priceNum * rate / 100).toFixed(2);
+    if (commission <= 0) return;
+    aff.reseller.commission = Math.max(0, (aff.reseller.commission || 0) - commission);
+    aff.reseller.orders = Math.max(0, (aff.reseller.orders || 0) - 1);
     await env.SUB_STORE.put(aff.key, JSON.stringify(aff.reseller));
   } catch (e) {}
 }
@@ -1662,6 +1688,8 @@ async function handleStoreBot(request, env) {
 
       if (cbData === "cancel_buy") {
         await answerCb(STORE_BOT_TOKEN, cb.id, "❌ 已取消");
+        try { await env.SUB_STORE.delete(`rl_plan_${cbChatId}`); } catch (e) {}
+        try { await env.SUB_STORE.delete(`rl_order_${cbChatId}`); } catch (e) {}
         try { await delMsg(STORE_BOT_TOKEN, cbChatId, cb.message.message_id); } catch (e) {}
         return new Response("OK");
       }
@@ -1670,6 +1698,8 @@ async function handleStoreBot(request, env) {
       if (cbData.startsWith("cancel_order_")) {
         const oid = cbData.replace("cancel_order_", "");
         await env.SUB_STORE.delete(`pending_${oid}`);
+        try { await env.SUB_STORE.delete(`rl_plan_${cbChatId}`); } catch (e) {}
+        try { await env.SUB_STORE.delete(`rl_order_${cbChatId}`); } catch (e) {}
         try { await delMsg(STORE_BOT_TOKEN, cbChatId, cb.message.message_id); } catch (e) {}
         try {
           await sendText(ADMIN_BOT_TOKEN, ADMIN_ID, `🚫 【订单已取消】\n订单号: ${oid}\n买家 ChatID: ${cbChatId}\n\n该订单未付款，已被买家取消。`);
@@ -1702,7 +1732,7 @@ async function handleStoreBot(request, env) {
           try { await delMsg(STORE_BOT_TOKEN, cbChatId, cb.message.message_id); } catch (e) {}
           return new Response("OK");
         }
-        if (!(await rateLimit(env, "order", cbChatId, 5))) {
+        if (!(await rateLimit(env, "plan", cbChatId, 5))) {
           await answerCb(STORE_BOT_TOKEN, cb.id, "⏳ 操作太快啦，请稍后再试");
           return new Response("OK");
         }
@@ -2195,7 +2225,8 @@ async function handleAdminBot(request, env) {
 
           await env.SUB_STORE.put(`revoke_${cb.message.message_id}`, JSON.stringify({
             uid: finalUid, chatId: targetChatIdNum, prevExpiry, isNew: !existingUid,
-            days, orderId: orderPlan ? orderPlan.orderId : null, time: Date.now()
+            days, orderId: orderPlan ? orderPlan.orderId : null,
+            planPrice: orderPlan ? orderPlan.planPrice : null, time: Date.now()
           }), { expirationTtl: 86400 });
 
           await logAction(env, existingUid ? "确认续费" : "确认发货", `UID:${finalUid} ChatID:${targetChatId} ${planLabel} ${days}天`);
@@ -2244,8 +2275,9 @@ async function handleAdminBot(request, env) {
         await logAction(env, "拒绝凭证", `订单:${rOid} 买家:${rBuyer}`);
         if (!isNaN(rBuyer)) {
           try {
-            await sendText(STORE_BOT_TOKEN, rBuyer,
-              `❌ 【付款凭证未通过审核】\n您的截图不清晰或金额不符，请重新发送清晰的转账截图。\n\n如有疑问请联系客服。`);
+            await sendMenu(STORE_BOT_TOKEN, rBuyer,
+              `❌ 【付款凭证未通过审核】\n您的截图不清晰或金额不符。\n\n请点下方【🛒 购买套餐】重新下单，付款后再发送转账截图。\n\n如有疑问请联系客服。`,
+              STORE_MENU);
           } catch (e) {}
         }
         replyAlert = `❌ 已拒绝买家 [${rBuyer}] 的凭证，已通知重新提交`;
@@ -2349,7 +2381,9 @@ async function handleAdminBot(request, env) {
                   } catch (e) {}
                 }
               } catch (e) {}
+              if (rev.planPrice) await revokeResellerCredit(env, rev.chatId, rev.planPrice);
             }
+            await logAction(env, rev.isNew ? "撤销发货" : "撤销续费", `UID:${rev.uid} ChatID:${rev.chatId} 已恢复原到期时间`);
             await env.SUB_STORE.delete(`revoke_${msgId}`);
           }
         }
@@ -2554,19 +2588,28 @@ async function handleAdminBot(request, env) {
       }
 
       // 用户快捷列表
-      else if (data === "sc_list") {
+      else if (data === "sc_list" || data.startsWith("sc_list_page_")) {
+        const page = data.startsWith("sc_list_page_") ? (parseInt(data.replace("sc_list_page_", "")) || 1) : 1;
         const scKeys = await listAllKeys(env, "user_", 5000);
         if (scKeys.length === 0) {
           replyAlert = "📭 当前没有任何用户";
         } else {
+          const perPage = 30;
+          const totalPages = Math.max(1, Math.ceil(scKeys.length / perPage));
+          const p = Math.max(1, Math.min(page, totalPages));
+          const pageKeys = scKeys.slice((p - 1) * perPage, p * perPage);
           const rows = [];
           let row = [];
-          for (const k of scKeys) {
+          for (const k of pageKeys) {
             row.push({ text: k.replace("user_", ""), callback_data: `ops_${k.replace("user_", "")}` });
             if (row.length === 3) { rows.push(row); row = []; }
           }
           if (row.length) rows.push(row);
-          replyText = `👥 【用户列表】\n点击 UID 进入操作面板：\n\n（共 ${scKeys.length} 位用户）`;
+          const nav = [];
+          if (p > 1) nav.push({ text: "◀️ 上一页", callback_data: `sc_list_page_${p - 1}` });
+          if (p < totalPages) nav.push({ text: "下一页 ▶️", callback_data: `sc_list_page_${p + 1}` });
+          if (nav.length) rows.push(nav);
+          replyText = `👥 【用户列表】(${scKeys.length} 位 · 第 ${p}/${totalPages} 页)\n点击 UID 进入操作面板：`;
           replyMarkup = { inline_keyboard: rows };
         }
       }
@@ -3252,16 +3295,20 @@ async function handleAdminBot(request, env) {
       const content = text.trim();
       if (content === "✅ 确认群发") {
         const userKeys = await listAllKeys(env, "user_", 10000);
-        let sentCount = 0;
+        let sentCount = 0, failCount = 0;
         const draft = actionState.draft || "";
         for (const k of userKeys) {
           const u = JSON.parse(await env.SUB_STORE.get(k));
           if (u.chatId) {
-            try { await sendText(STORE_BOT_TOKEN, u.chatId, `📢 ${draft}`); sentCount++; } catch (e) {}
+            try { await sendText(STORE_BOT_TOKEN, u.chatId, `📢 ${draft}`); sentCount++; }
+            catch (e) { failCount++; }
+            await new Promise(r => setTimeout(r, 60));
           }
         }
         await env.SUB_STORE.delete("admin_action_state");
-        await sendMenu(ADMIN_BOT_TOKEN, chatId, `✅ 【群发完成】\n已发送给 ${sentCount} 位用户`, MAIN_MENU);
+        await sendMenu(ADMIN_BOT_TOKEN, chatId,
+          `✅ 【群发完成】\n已发送给 ${sentCount} 位用户${failCount > 0 ? `\n⚠️ 失败 ${failCount} 位（用户可能未与 Bot 建立会话）` : ""}`,
+          MAIN_MENU);
       } else if (content === "❌ 取消群发" || content === "取消") {
         await env.SUB_STORE.delete("admin_action_state");
         await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 已取消群发", MAIN_MENU);
