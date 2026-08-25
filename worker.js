@@ -335,10 +335,12 @@ async function addUpstream(env, url, note) {
     pool[0].isDefault = true;
     pool[0].status = "active";
     await saveUpstreamPool(env, pool);
+    await clearAllCache(env);
     return { ok: true, msg: `已添加并设为默认上游`, index: 0, isDefault: true };
   }
   pool.push({ url, note: note || `上游${pool.length + 1}`, status: "active", addedAt: Date.now(), isDefault: first });
   await saveUpstreamPool(env, pool);
+  await clearAllCache(env);
   return { ok: true, msg: `已添加，当前共 ${pool.length} 个上游`, index: pool.length - 1, isDefault: first };
 }
 
@@ -348,6 +350,7 @@ async function removeUpstream(env, index) {
   const removed = pool.splice(index, 1)[0];
   if (removed.isDefault && pool.length > 0) pool[0].isDefault = true;
   await saveUpstreamPool(env, pool);
+  await clearAllCache(env);
   return { ok: true, msg: `已删除: ${removed.note || removed.url.slice(0, 30)}` };
 }
 
@@ -356,6 +359,7 @@ async function setDefaultUpstream(env, index) {
   if (isNaN(index) || index < 0 || index >= pool.length) return { ok: false, msg: "序号无效" };
   pool.forEach((u, i) => { u.isDefault = (i === index); });
   await saveUpstreamPool(env, pool);
+  await clearAllCache(env);
   return { ok: true, msg: `已将第 ${index + 1} 个设为默认` };
 }
 
@@ -1020,7 +1024,7 @@ async function sendMyOrders(env, chatId) {
   }
   mine.sort((a, b) => (b.time || 0) - (a.time || 0));
   if (mine.length === 0) {
-    await sendMenu(STORE_BOT_TOKEN, chatId, "📋 您当前没有进行中的订单。\n\n点【🛒 购买套餐】开始！", STORE_MENU);
+    await sendMenu(STORE_BOT_TOKEN, chatId, "📋 您当前没有进行中的订单。\n\n💡 订单超过 30 分钟未支付会自动失效。\n点【🛒 购买套餐】重新下单！", STORE_MENU);
     return;
   }
   let msg = `📋 【我的订单】(${mine.length} 笔)\n\n`;
@@ -1539,7 +1543,7 @@ async function handleRenewPage(uid, request, env) {
           reply_markup: adminMarkup,
           parse_mode: "Markdown"
         });
-        await env.SUB_STORE.put(`renew_notify_${uid}`, now.toString(), { expirationTtl: 1800 });
+        await env.SUB_STORE.put(`renew_notify_${uid}`, JSON.stringify({ time: now, days }), { expirationTtl: 1800 });
       }
     } catch (e) {}
   }
@@ -2170,7 +2174,12 @@ async function handleAdminBot(request, env) {
           replyText = `❌ 用户 UID:${rUid} 不存在`;
         } else {
           const ru = JSON.parse(rUserStr);
-          const days = parseInt(await env.SUB_STORE.get("default_days")) || DEFAULT_DAYS;
+          let renewDays = null;
+          try {
+            const snap = await env.SUB_STORE.get(`renew_notify_${rUid}`);
+            if (snap) { const s = JSON.parse(snap); if (s && s.days) renewDays = parseInt(s.days); }
+          } catch (e) {}
+          const days = renewDays || (parseInt(await env.SUB_STORE.get("default_days")) || DEFAULT_DAYS);
           const prevExpiry = ru.expiry;
           await env.SUB_STORE.put(renewProcessedKey, JSON.stringify({ chatId: rChatId, time: Date.now() }), { expirationTtl: 31536000 });
           ru.expiry = Math.max(ru.expiry, Date.now()) + (days * 86400000);
@@ -2345,21 +2354,27 @@ async function handleAdminBot(request, env) {
         const rparts = data.replace("reject_proof_", "").split("_");
         const rOid = rparts[0];
         const rBuyer = parseInt(rparts.slice(1).join("_"));
-        await env.SUB_STORE.delete(`pending_${rOid}`);
-        await logAction(env, "拒绝凭证", `订单:${rOid} 买家:${rBuyer}`);
-        if (!isNaN(rBuyer)) {
+        const rRejectKey = `processed_reject_${rOid}`;
+        if (await env.SUB_STORE.get(rRejectKey)) {
+          replyAlert = "⚠️ 该凭证已被处理过了，请勿重复操作！";
+        } else {
+          await env.SUB_STORE.put(rRejectKey, JSON.stringify({ time: Date.now() }), { expirationTtl: 31536000 });
+          await env.SUB_STORE.delete(`pending_${rOid}`);
+          await logAction(env, "拒绝凭证", `订单:${rOid} 买家:${rBuyer}`);
+          if (!isNaN(rBuyer)) {
+            try {
+              await sendMenu(STORE_BOT_TOKEN, rBuyer,
+                `❌ 【付款凭证未通过审核】\n您的截图不清晰或金额不符。\n\n请点下方【🛒 购买套餐】重新下单，付款后再发送转账截图。\n\n如有疑问请联系客服。`,
+                STORE_MENU);
+            } catch (e) {}
+          }
+          replyAlert = `❌ 已拒绝买家 [${rBuyer}] 的凭证，已通知重新提交`;
           try {
-            await sendMenu(STORE_BOT_TOKEN, rBuyer,
-              `❌ 【付款凭证未通过审核】\n您的截图不清晰或金额不符。\n\n请点下方【🛒 购买套餐】重新下单，付款后再发送转账截图。\n\n如有疑问请联系客服。`,
-              STORE_MENU);
+            await editMsg(ADMIN_BOT_TOKEN, cb.message.chat.id, cb.message.message_id,
+              `❌ 【凭证已拒绝】\n订单: ${rOid}\n已通知买家重新提交。`,
+              { inline_keyboard: [] });
           } catch (e) {}
         }
-        replyAlert = `❌ 已拒绝买家 [${rBuyer}] 的凭证，已通知重新提交`;
-        try {
-          await editMsg(ADMIN_BOT_TOKEN, cb.message.chat.id, cb.message.message_id,
-            `❌ 【凭证已拒绝】\n订单: ${rOid}\n已通知买家重新提交。`,
-            null);
-        } catch (e) {}
       }
 
       // 撤销删除用户
@@ -3517,7 +3532,17 @@ async function handleAdminBot(request, env) {
       if (!name) {
         await sendMenu(ADMIN_BOT_TOKEN, chatId, "❌ 名称无效，已取消", MAIN_MENU);
       } else {
-        const code = "R" + Math.floor(10000 + Math.random() * 90000);
+        // 邀请码唯一性：生成不与现有分销商冲突的 R+5 位数字码
+        let code = "";
+        const existCodes = new Set();
+        for (const rk of await listAllKeys(env, "reseller_", 2000)) {
+          try { existCodes.add(JSON.parse(await env.SUB_STORE.get(rk)).code); } catch (e) {}
+        }
+        for (let i = 0; i < 10; i++) {
+          const c = "R" + Math.floor(10000 + Math.random() * 90000);
+          if (!existCodes.has(c)) { code = c; break; }
+        }
+        if (!code) code = "R" + Math.floor(10000 + Math.random() * 90000) + Date.now().toString().slice(-2);
         const id = Date.now().toString(36);
         await env.SUB_STORE.put(`reseller_${id}`, JSON.stringify({ code, name, commission: 0, clicks: 0, createdAt: Date.now() }));
         await sendMenu(ADMIN_BOT_TOKEN, chatId,
@@ -4689,21 +4714,23 @@ async function handleAdminBot(request, env) {
             `📊 【用户: ${scUid}】\n• 状态: ${stateDesc}\n• 剩余: ${Math.max(0, remainDays)} 天\n• 到期: ${new Date(su.expiry).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}\n• ChatID: ${su.chatId || "-"}\n${su.note ? `• 备注: ${su.note}\n` : ""}• 上游: ${upStatus}\n\n请选择操作：`,
             opsButtons(scUid));
         }
-      } else {
-        const scKeys = await listAllKeys(env, "user_", 5000);
-        if (scKeys.length === 0) {
-          await sendMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有任何用户", MAIN_MENU);
         } else {
-          const rows = [];
-          let row = [];
-          for (const k of scKeys) {
-            row.push({ text: k.replace("user_", ""), callback_data: `ops_${k.replace("user_", "")}` });
-            if (row.length === 3) { rows.push(row); row = []; }
+          const scKeysAll = await listAllKeys(env, "user_", 5000);
+          if (scKeysAll.length === 0) {
+            await sendMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有任何用户", MAIN_MENU);
+          } else {
+            const scKeys = scKeysAll.slice(0, 90);
+            const rows = [];
+            let row = [];
+            for (const k of scKeys) {
+              row.push({ text: k.replace("user_", ""), callback_data: `ops_${k.replace("user_", "")}` });
+              if (row.length === 3) { rows.push(row); row = []; }
+            }
+            if (row.length) rows.push(row);
+            const overflow = scKeysAll.length - scKeys.length;
+            await sendMenu(ADMIN_BOT_TOKEN, chatId, `👥 【用户列表】\n点击 UID 进入操作面板：\n\n（共 ${scKeysAll.length} 位用户${overflow > 0 ? `，仅显示前 ${scKeys.length} 位` : ""}）\n${overflow > 0 ? `\n更多用户请用 \`/sc UID\` 或「📋 用户列表」查看。` : ""}`, { inline_keyboard: rows });
           }
-          if (row.length) rows.push(row);
-          await sendMenu(ADMIN_BOT_TOKEN, chatId, `👥 【用户列表】\n点击 UID 进入操作面板：\n\n（共 ${scKeys.length} 位用户）`, { inline_keyboard: rows });
         }
-      }
       return new Response("OK");
     }
 
