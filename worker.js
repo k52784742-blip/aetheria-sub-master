@@ -706,7 +706,8 @@ async function redeemCoupon(env, code, chatId) {
   }), { expirationTtl: 15552000 });
 
   await creditReseller(env, chatId, "");
-  return { ok: true, msg: "🎉 优惠券兑换成功", uid: finalUid, days: actualDays, plan: coupon.note, discount: coupon.discountPct };
+  const renewTip = isRenew ? "（您已有订阅，时长已顺延叠加）" : "";
+  return { ok: true, msg: `🎉 优惠券兑换成功${renewTip}`, uid: finalUid, days: actualDays, plan: coupon.note, discount: coupon.discountPct };
 }
 
 async function redeemCard(env, code, chatId) {
@@ -729,7 +730,8 @@ async function redeemCard(env, code, chatId) {
   }), { expirationTtl: 15552000 });
 
   await creditReseller(env, chatId, card.price);
-  return { ok: true, msg: "🎉 兑换成功", uid: finalUid, days: card.days, plan: card.planName };
+  const renewTip = isRenew ? "（您已有订阅，时长已顺延叠加）" : "";
+  return { ok: true, msg: `🎉 兑换成功${renewTip}`, uid: finalUid, days: card.days, plan: card.planName };
 }
 
 // ==================== 分销 ====================
@@ -1643,6 +1645,8 @@ async function sendOrderPayInfo(env, chatId, plan, method) {
   const orderId = genOrderId();
   const methodLabel = payMethodLabel(method.id);
   const cancelMarkup = { inline_keyboard: [[{ text: "❌ 取消订单", callback_data: `cancel_order_${orderId}` }]] };
+  const existingUid = await findUidByChatId(env, chatId);
+  const renewHint = existingUid ? `\n\n📌 您已拥有订阅（UID:${existingUid}），购买成功后时长将自动【顺延叠加】，不会覆盖现有订阅。` : "";
 
   if (method.id === "usdt") {
     const usdt = await getUsdtInfo(env);
@@ -1654,7 +1658,7 @@ async function sendOrderPayInfo(env, chatId, plan, method) {
     const cnyPrice = extractAmount(plan.price);
     const usdtAmount = cnyToUsdt(cnyPrice, rate);
     await sendMenu(STORE_BOT_TOKEN, chatId,
-      `🪙 【USDT 支付】\n\n• 订单编号: \`${orderId}\`\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}${usdtAmount ? ` ≈ **${usdtAmount} USDT**（汇率 1 USDT = ¥${rate}）` : ""}\n\n📮 收款地址:\n\`${usdt.address}\`\n\n🌐 网络: ${usdt.network}\n\n📌 请务必使用 ${usdt.network} 网络转账 **${usdtAmount || "对应"} USDT**，金额与套餐一致\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付`,
+      `🪙 【USDT 支付】\n\n• 订单编号: \`${orderId}\`\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}${usdtAmount ? ` ≈ **${usdtAmount} USDT**（汇率 1 USDT = ¥${rate}）` : ""}\n\n📮 收款地址:\n\`${usdt.address}\`\n\n🌐 网络: ${usdt.network}\n\n📌 请务必使用 ${usdt.network} 网络转账 **${usdtAmount || "对应"} USDT**，金额与套餐一致\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付${renewHint}`,
       cancelMarkup);
     await env.SUB_STORE.put(`pending_${orderId}`, JSON.stringify({
       chatId, orderId, time: Date.now(), type: "new",
@@ -1684,7 +1688,7 @@ async function sendOrderPayInfo(env, chatId, plan, method) {
       body: JSON.stringify({
         chat_id: chatId,
         photo: qrFileId,
-        caption: `💎 【自助下单结算】\n\n• 订单编号: \`${orderId}\`\n• 支付方式: ${methodLabel}\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}\n\n📌 请使用${methodLabel}扫描下方二维码完成支付\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付`,
+        caption: `💎 【自助下单结算】\n\n• 订单编号: \`${orderId}\`\n• 支付方式: ${methodLabel}\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}\n\n📌 请使用${methodLabel}扫描下方二维码完成支付\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付${renewHint}`,
         parse_mode: "Markdown",
         reply_markup: cancelMarkup
       })
@@ -2028,6 +2032,25 @@ async function handleStoreBot(request, env) {
           STORE_MENU);
         return new Response("OK");
       }
+      // 未配置客服外链时，把买家咨询转达给管理员（限流防刷屏）
+      const svcContact = (await env.SUB_STORE.get("service_contact")) || "";
+      if (!svcContact) {
+        if (!(await rateLimit(env, "msg2admin", chatId, 60))) {
+          await sendMenu(STORE_BOT_TOKEN, chatId,
+            `💬 消息发送太频繁，请稍后再试（每分钟限 1 条）\n\n如需帮助请使用下方菜单：\n🛒 购买套餐 / 🔍 查询订阅 / 📋 我的订单`,
+            STORE_MENU);
+          return new Response("OK");
+        }
+        const fwdOk = await tg(STORE_BOT_TOKEN, "forwardMessage", {
+          chat_id: ADMIN_ID, from_chat_id: chatId, message_id: msg.message_id
+        }).then(r => r.ok === true).catch(() => false);
+        await sendMenu(STORE_BOT_TOKEN, chatId,
+          fwdOk
+            ? `💬 您的问题已转达客服，请耐心等待回复！\n（管理员回复会通过本 Bot 私信您）`
+            : `💬 消息转达失败，请稍后再试，或使用下方菜单选择【📞 联系客服】`,
+          STORE_MENU);
+        return new Response("OK");
+      }
       await sendMenu(STORE_BOT_TOKEN, chatId,
         `💬 收到您的消息！\n\n如需帮助请使用下方菜单：\n🛒 购买套餐 / 🔍 查询订阅 / 🎫 兑换卡密 / 📋 我的订单 / 📞 联系客服\n\n📌 温馨提示：付款成功后，请直接发送【转账截图/付款凭证图片】，系统会自动提交审核。`,
         STORE_MENU);
@@ -2103,7 +2126,11 @@ async function handleStoreBot(request, env) {
       reply_markup: replyMarkup
     });
 
-    await sendMenu(STORE_BOT_TOKEN, chatId, "📩 凭证已成功提交给管理员，请稍候！", STORE_MENU);
+    await sendMenu(STORE_BOT_TOKEN, chatId,
+      orderInfo
+        ? "📩 凭证已成功提交给管理员，请稍候！"
+        : "📩 凭证已提交给管理员！\n\n⚠️ 未找到您近期的待审订单（订单超 30 分钟未支付会自动失效）。\n若管理员无法核实，请点击【🛒 购买套餐】重新下单。",
+      STORE_MENU);
     return new Response("OK");
   } catch (err) {
     console.error("[store-bot] handler error:", err);
