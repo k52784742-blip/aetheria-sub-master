@@ -895,9 +895,10 @@ A: `git pull` 拉取最新 → `wrangler deploy` 重新部署。
 ├── server.js              VPS 服务器运行适配器（Node.js 版）
 ├── package.json           Node.js 项目配置（VPS 版用）
 ├── .env.example           VPS 环境变量模板
-├── wrangler.toml          本地部署配置（敏感，已 gitignore）
+├── wrangler.toml          本地部署配置（敏感，已 gitignore，不入库）
 ├── wrangler.toml.example  配置模板（GitHub 共享）
 ├── .dev.vars.example      本地开发变量模板
+├── .github/workflows/     GitHub Actions 自动部署工作流
 ├── .gitignore             排除敏感文件
 ├── README.md              本文档
 └── LICENSE                MIT 协议
@@ -906,6 +907,22 @@ A: `git pull` 拉取最新 → `wrangler deploy` 重新部署。
 **双模式说明**：
 - **免费模式**（Cloudflare Workers）：只用 `worker.js`
 - **VPS 模式**（自建服务器）：用 `server.js` + `worker.js` + `package.json` + `.env`
+
+---
+
+## 🛠️ 更新日志
+
+### 2026-08-20 修复多项关键 Bug
+- **循环通知**：修复 Cron 到期提醒写入 `user_undefined`（key 误用 `k.name`），导致 `lastNotified` 永不生效、每天重复通知管理员/买家的问题
+- **订阅导入失败**：修复节点多时 `String.fromCharCode(...大数组)` 栈溢出导致的订阅生成失败（改用分块 `utf8ToBase64` 编码）
+- **消息发送失败**：Markdown 特殊字符（`_` `*` `[` `]` `` ` ``）导致 Telegram 400 → 新增 `escMD` 转义 + 发送失败自动降级纯文本重试
+- **审核通知丢失**：买家昵称含特殊字符时管理员收不到付款凭证审核通知（已转义）
+- **重复续费**：`approve_renew_` 缺幂等保护，重复点击会重复加天数/通知（已加 `processed_` 标记）
+- **日报时区**：每日运营日报按 UTC 统计昨日数据（修复本地时区跨天错位）
+- **上游解码**：宽松 Base64 解码（去空白重试，解码结果需含 `://` 才采用）
+- **空订阅提示**：无可用节点时返回明确 502 提示，避免客户端导入空订阅
+- **XSS 防护**：公告/套餐名等用户可控字段渲染 HTML 前转义（`escHTML`）
+- **审核闭环**：确认到账后仅保留撤销按钮（防重复点击）；「稍后处理」保留原确认按钮可继续操作
 
 ---
 
