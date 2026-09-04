@@ -1235,6 +1235,10 @@ async function handleStoreBot(request, env) {
           // 回调带上订单号，确认时精确匹配对应订单，避免多订单混淆
           { text: "🟢 确认到账 · 一键开通", callback_data: `approve_${chatId}_${orderInfo ? orderInfo.orderId : "0"}` },
           { text: "⏳ 稍后处理", callback_data: "later" }
+        ],
+        [
+          // 凭证无效时可拒绝，通知买家重新提交
+          { text: "❌ 拒绝凭证", callback_data: `reject_proof_${chatId}_${orderInfo ? orderInfo.orderId : "0"}` }
         ]
       ]
     };
@@ -1364,6 +1368,7 @@ async function handleAdminBot(request, env) {
             ru.expiry = base + (days * 86400000);
             ru.status = "active";
             await env.SUB_STORE.put(`user_${rUid}`, JSON.stringify(ru));
+            await clearUserCache(env, rUid); // 清除缓存，让订阅 expire 头立即更新
 
             const rOrderId = "RENEW-" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
             // 记流水
@@ -1506,6 +1511,7 @@ async function handleAdminBot(request, env) {
             existing.status = "active";
             if (orderPlan) existing.plan = planLabel;
             await env.SUB_STORE.put(`user_${existingUid}`, JSON.stringify(existing));
+            await clearUserCache(env, existingUid); // 清除缓存，让订阅 expire 头立即更新
             finalUid = existingUid;
           } else {
             // 新购：创建新订阅（唯一 UID）
@@ -1591,6 +1597,34 @@ async function handleAdminBot(request, env) {
         replyAlert = "⏳ 已标记【稍后处理】\n\n此凭证暂不处理，您可稍后直接点下方【确认到账】按钮。";
       }
 
+      // 拒绝付款凭证：通知买家凭证无效，请重新提交
+      else if (data.startsWith("reject_proof_")) {
+        const rpParts = data.replace("reject_proof_", "").split("_");
+        const rpChatId = rpParts[0];
+        const rpOrderId = rpParts.slice(1).join("_") || "0";
+        // 幂等保护：同一通知消息只处理一次
+        const rpProcessedKey = `processed_${cb.message.message_id}`;
+        const rpAlreadyProcessed = await env.SUB_STORE.get(rpProcessedKey);
+        if (rpAlreadyProcessed) {
+          replyAlert = "⚠️ 该凭证已被处理过了，请勿重复操作！";
+        } else {
+          await env.SUB_STORE.put(rpProcessedKey, JSON.stringify({ chatId: rpChatId, time: Date.now() }), { expirationTtl: 86400 });
+          await logAction(env, "拒绝凭证", `ChatID:${rpChatId} 订单:${rpOrderId}`);
+          // 通知买家凭证被拒绝
+          try {
+            await sendTGText(STORE_BOT_TOKEN, parseInt(rpChatId),
+              `❌ 【凭证审核未通过】\n您提交的付款凭证未能通过审核。\n\n可能原因：\n• 截图不清晰 / 金额不符\n• 未显示完整订单号\n\n请重新发送【转账截图/付款凭证图片】提交审核。`);
+          } catch (e) {}
+          replyAlert = `❌ 已拒绝该凭证，已通知买家重新提交。`;
+          // 编辑管理端消息标记已处理
+          try {
+            await editTGMessage(ADMIN_BOT_TOKEN, cb.message.chat.id, cb.message.message_id,
+              `❌ 【凭证已拒绝】\n买家 ChatID: ${rpChatId}\n订单: ${rpOrderId || "—"}\n\n已通知买家重新提交凭证。`,
+              null);
+          } catch (e) {}
+        }
+      }
+
       // 撤销删除用户操作
       else if (data.startsWith("revoke_del_")) {
         const dId = data.replace("revoke_del_", "");
@@ -1651,6 +1685,7 @@ async function handleAdminBot(request, env) {
             const u = JSON.parse(userDataStr);
             u.expiry = adj.prevExpiry;
             await env.SUB_STORE.put(`user_${adj.uid}`, JSON.stringify(u));
+            await clearUserCache(env, adj.uid); // 清除缓存
             // 删除撤销记录，防止重复撤销
             await env.SUB_STORE.delete(`revoke_adjust_${adjId}`);
             replyText = `↩️ 已撤销！UID:${adj.uid} 已恢复原到期时间`;
@@ -1685,6 +1720,7 @@ async function handleAdminBot(request, env) {
               const u = JSON.parse(userDataStr);
               u.expiry = rev.prevExpiry;
               await env.SUB_STORE.put(`user_${rev.uid}`, JSON.stringify(u));
+              await clearUserCache(env, rev.uid); // 清除缓存，让订阅 expire 头立即更新
               // 通知买家
               await sendTGText(STORE_BOT_TOKEN, rev.chatId,
                 `⚠️ 【续费已撤销】\n管理员撤销了刚才的续费操作，订阅时长已恢复。\n如您已付款请联系客服核实。`
@@ -1723,6 +1759,7 @@ async function handleAdminBot(request, env) {
           if (d.uid === uid) {
             await env.SUB_STORE.put(`user_${uid}`, JSON.stringify(d.data));
             await indexUserChatId(env, d.data.chatId, uid); // 恢复索引
+            await clearUserCache(env, uid); // 清除缓存（如有残留）
             await env.SUB_STORE.delete(k);
             found = true;
             break;
@@ -1747,15 +1784,31 @@ async function handleAdminBot(request, env) {
           if (action === "disable") {
             u.status = "disabled";
             await env.SUB_STORE.put(`user_${uid}`, JSON.stringify(u));
+            await clearUserCache(env, uid); // 清除缓存立即生效
             await logAction(env, "禁用用户", `UID:${uid} ChatID:${u.chatId || "-"}`);
             replyText = `🔴 用户 [${uid}] 已禁用！\n\n订阅将立即停止服务。`;
             replyMarkup = { inline_keyboard: [[{ text: "🟢 重新开启", callback_data: `enable_${uid}` }]] };
+            // 通知买家
+            if (u.chatId) {
+              try {
+                await sendTGText(STORE_BOT_TOKEN, u.chatId,
+                  `🔴 【服务暂停通知】\n您的订阅已被管理员暂停。\n\n如有疑问请联系客服。`);
+              } catch (e) {}
+            }
           } else if (action === "enable") {
             u.status = "active";
             await env.SUB_STORE.put(`user_${uid}`, JSON.stringify(u));
+            await clearUserCache(env, uid); // 清除缓存立即生效
             await logAction(env, "启用用户", `UID:${uid} ChatID:${u.chatId || "-"}`);
             replyText = `🟢 用户 [${uid}] 已激活！\n\n服务已恢复。`;
             replyMarkup = { inline_keyboard: [[{ text: "🔴 禁用", callback_data: `disable_${uid}` }]] };
+            // 通知买家
+            if (u.chatId) {
+              try {
+                await sendTGText(STORE_BOT_TOKEN, u.chatId,
+                  `🟢 【服务已恢复】\n您的订阅已重新激活！\n\n感谢您的支持，祝使用愉快~`);
+              } catch (e) {}
+            }
           } else if (action === "del") {
             // 保存删除前的数据，供撤销恢复
             const delId = Date.now();
@@ -1770,6 +1823,13 @@ async function handleAdminBot(request, env) {
             await logAction(env, "删除用户", `UID:${uid} ChatID:${u.chatId || "-"}`);
             replyText = `🗑️ 用户 [${uid}] 已删除！\n\n如需恢复请点击下方按钮：`;
             replyMarkup = { inline_keyboard: [[{ text: "↩️ 恢复用户", callback_data: `undel_${uid}` }]] };
+            // 通知买家
+            if (u.chatId) {
+              try {
+                await sendTGText(STORE_BOT_TOKEN, u.chatId,
+                  `⚠️ 【订阅已取消】\n您的订阅已被管理员删除。\n\n如您已付款请联系客服核实。`);
+              } catch (e) {}
+            }
           }
         }
       }
@@ -2145,7 +2205,7 @@ async function handleAdminBot(request, env) {
             if (arg === "auto") {
               delete u.upstreamUrl;
               await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
-              await env.SUB_STORE.delete(`cache_${targetUid}`);
+              await clearUserCache(env, targetUid); // 清除全部缓存变体立即生效
               await env.SUB_STORE.delete("admin_action_state");
               replyText = `✅ 用户 [${targetUid}] 已恢复自动分配上游！`;
             } else {
@@ -2157,7 +2217,7 @@ async function handleAdminBot(request, env) {
                 const up = pool[upIdx];
                 u.upstreamUrl = up.url;
                 await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
-                await env.SUB_STORE.delete(`cache_${targetUid}`);
+                await clearUserCache(env, targetUid); // 清除全部缓存变体立即生效
                 await env.SUB_STORE.delete("admin_action_state");
                 await logAction(env, "分配上游", `UID:${targetUid} → ${up.note || up.url.slice(0, 30)}`);
                 replyText = `✅ 已为用户 [${targetUid}] 分配专属上游！\n\n📡 ${up.note || "上游" + (upIdx + 1)}\n${up.url}\n\n该用户订阅将使用此线路。`;
@@ -2176,6 +2236,40 @@ async function handleAdminBot(request, env) {
           } catch (e) {}
         }
         replyAlert = "❌ 已取消操作，提示消息已清除";
+      }
+
+      // 群发二次确认：确认发送
+      else if (data === "broadcast_send") {
+        const bStateStr = await env.SUB_STORE.get("admin_action_state");
+        let bContent = "";
+        try {
+          const bState = JSON.parse(bStateStr);
+          if (bState.mode === "broadcast_confirm" && bState.content) bContent = bState.content;
+        } catch (e) {}
+        if (!bContent) {
+          replyText = "❌ 群发内容已过期，请重新输入";
+          await env.SUB_STORE.delete("admin_action_state");
+        } else {
+          // 先删除管理端提示消息
+          if (cb.message && cb.message.message_id) {
+            try { await deleteTGMessage(ADMIN_BOT_TOKEN, cb.message.chat.id, cb.message.message_id); } catch (e) {}
+          }
+          const bUserKeys = await listAllKeys(env, "user_", 10000);
+          let bSent = 0;
+          for (const bk of bUserKeys) {
+            try {
+              const bu = JSON.parse(await env.SUB_STORE.get(bk));
+              if (bu.chatId) {
+                await sendTGText(STORE_BOT_TOKEN, bu.chatId, `📢 ${bContent}`);
+                bSent++;
+              }
+            } catch (e) {}
+          }
+          await env.SUB_STORE.delete("admin_action_state");
+          await logAction(env, "群发通知", `发送给 ${bSent} 位用户`);
+          await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `✅ 【群发完成】\n已发送给 ${bSent} 位用户`, MAIN_MENU);
+          return new Response("OK");
+        }
       }
 
       // 删除分销商
@@ -2426,7 +2520,7 @@ async function handleAdminBot(request, env) {
       if (upArg === "auto") {
         delete u.upstreamUrl;
         await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
-        await env.SUB_STORE.delete(`cache_${targetUid}`);
+        await clearUserCache(env, targetUid);
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `✅ 用户 [${targetUid}] 已恢复自动分配上游！`, MAIN_MENU);
         return new Response("OK");
       }
@@ -2439,7 +2533,7 @@ async function handleAdminBot(request, env) {
       const up = pool[upIdx];
       u.upstreamUrl = up.url;
       await env.SUB_STORE.put(`user_${targetUid}`, JSON.stringify(u));
-      await env.SUB_STORE.delete(`cache_${targetUid}`);
+      await clearUserCache(env, targetUid);
       await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
         `✅ 已为用户 [${targetUid}] 分配专属上游！\n\n📡 ${up.note || "上游" + (upIdx + 1)}\n${up.url}`,
         MAIN_MENU);
@@ -2657,6 +2751,7 @@ async function handleAdminBot(request, env) {
         }
         u.status = "active";
         await env.SUB_STORE.put(`user_${uid}`, JSON.stringify(u));
+        await clearUserCache(env, uid); // 清除缓存，让订阅 expire 头立即更新
         await env.SUB_STORE.delete("admin_action_state");
 
         // 保存撤销记录（恢复原到期时间）
@@ -3678,22 +3773,56 @@ async function handleAdminBot(request, env) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chatId,
-          text: "📣 【群发通知】\n请发送要群发的消息内容：\n\n（将发送给所有已开通用户）",
+          text: "📣 【群发通知】\n请发送要群发的消息内容：\n\n（将发送给所有已开通用户，发送前会二次确认）",
           reply_markup: replyMarkup
         })
       });
       return new Response("OK");
     }
 
-    // 群发流程：收到文本
+    // 群发流程：收到文本 → 预览 + 二次确认
     if (actionState && actionState.mode === "broadcast") {
+      const userKeys = await listAllKeys(env, "user_", 10000);
+      // 统计有 ChatID 的目标用户数
+      let targetCount = 0;
+      for (const bk of userKeys) {
+        try {
+          const bu = JSON.parse(await env.SUB_STORE.get(bk));
+          if (bu.chatId) targetCount++;
+        } catch (e) {}
+      }
+      // 保存待发内容，等待确认
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "broadcast_confirm", content: text, chatId }));
+      const confirmMarkup = {
+        inline_keyboard: [
+          [
+            { text: "✅ 确认发送", callback_data: "broadcast_send" },
+            { text: "❌ 取消", callback_data: "cancel_action" }
+          ]
+        ]
+      };
+      await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: `📣 【群发预览】\n\n将发送给 ${targetCount} 位用户：\n\n${text}\n\n确认无误后点击【✅ 确认发送】：`,
+          reply_markup: confirmMarkup
+        })
+      });
+      return new Response("OK");
+    }
+
+    // 群发确认：收到文本
+    if (actionState && actionState.mode === "broadcast_confirm") {
+      const content = actionState.content;
       const userKeys = await listAllKeys(env, "user_", 10000);
       let sentCount = 0;
       for (const k of userKeys) {
         const u = JSON.parse(await env.SUB_STORE.get(k));
         if (u.chatId) {
           try {
-            await sendTGText(STORE_BOT_TOKEN, u.chatId, `📢 ${text}`);
+            await sendTGText(STORE_BOT_TOKEN, u.chatId, `📢 ${content}`);
             sentCount++;
           } catch (e) {}
         }
@@ -4654,6 +4783,7 @@ async function redeemCoupon(env, code, chatId) {
     existingUser.status = "active";
     existingUser.plan = coupon.note || `${actualDays} 天`;
     await env.SUB_STORE.put(`user_${existingUid}`, JSON.stringify(existingUser));
+    await clearUserCache(env, existingUid); // 清除缓存
   } else {
     finalUid = await genUniqueUid(env);
     await env.SUB_STORE.put(`user_${finalUid}`, JSON.stringify({
@@ -4756,6 +4886,7 @@ async function redeemCard(env, code, chatId) {
     existingUser.status = "active";
     existingUser.plan = card.planName;
     await env.SUB_STORE.put(`user_${existingUid}`, JSON.stringify(existingUser));
+    await clearUserCache(env, existingUid); // 清除缓存
   } else {
     // 新购：创建订阅（唯一 UID）
     finalUid = await genUniqueUid(env);
