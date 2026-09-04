@@ -238,6 +238,9 @@ async function handleWebhookSetup(request, env) {
       { command: "setup", description: "🔗 设上游 /setup 链接" },
       { command: "qrlist", description: "🖼️ 收款码列表" },
       { command: "qrdel", description: "🗑️ 删收款码 /qrdel 序号" },
+      { command: "setusdt", description: "🪙 设USDT地址 /setusdt 地址 [网络]" },
+      { command: "setrate", description: "💱 设USDT汇率 /setrate 7.2" },
+      { command: "paymethods", description: "💳 支付方式管理" },
       { command: "cancel", description: "❌ 取消当前操作" }
     ];
 
@@ -812,14 +815,11 @@ async function handleStoreBot(request, env) {
         return new Response("OK");
       }
 
-      // 选择套餐 → 显示收款码
+      // 选择套餐 → 展示支付方式选择
       if (cbData.startsWith("buyplan_")) {
         const planId = cbData.replace("buyplan_", "");
         const plans = await getPlans(env);
         const plan = plans.find(p => p.id === planId);
-        // 多收款码：随机取一张展示
-        const displayQR = await getDisplayQR(env);
-        const qrFileId = displayQR ? displayQR.fileId : null;
 
         // 防抖：检查该买家是否有未完成的待审订单（5分钟内），避免重复下单
         try {
@@ -841,74 +841,58 @@ async function handleStoreBot(request, env) {
           return new Response("OK");
         }
 
-        if (!qrFileId) {
-          await sendTGMenu(STORE_BOT_TOKEN, cbChatId, "⚠️ 系统收款码尚未配置，请联系管理员。", storeMenu);
+        // 获取可用支付方式
+        const methods = await getAvailablePayMethods(env);
+        if (methods.length === 0) {
+          await sendTGMenu(STORE_BOT_TOKEN, cbChatId, "⚠️ 系统暂未配置任何支付方式，请联系管理员。", storeMenu);
           return new Response("OK");
         }
 
-        // 频控：同一买家 5 秒内只能下一单，防刷
-        if (!(await rateLimit(env, "order", cbChatId, 5))) {
-          await answerCallback(STORE_BOT_TOKEN, cb.id, "⏳ 操作太快啦，请稍后再试");
+        // 只有一种方式：直接进入支付（减少点击）
+        if (methods.length === 1) {
+          await sendOrderPayInfo(env, cbChatId, plan, methods[0]);
           return new Response("OK");
         }
 
-        // 生成唯一订单号
-        const orderId = genOrderId();
-
-        // 发送收款码（检查结果：失败则清理订单，避免买家卡死）
-        const photoRes = await fetch(`https://api.telegram.org/bot${STORE_BOT_TOKEN}/sendPhoto`, {
+        // 多种方式：展示支付方式选择按钮
+        const methodBtns = methods.map(m => ([{ text: m.label, callback_data: `paymethod_${m.id}_${planId}` }]));
+        methodBtns.push([{ text: "❌ 取消", callback_data: "cancel_buy" }]);
+        await fetch(`https://api.telegram.org/bot${STORE_BOT_TOKEN}/sendMessage`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             chat_id: cbChatId,
-            photo: qrFileId,
-            caption: `💎 【自助下单结算】\n\n• 订单编号: \`${orderId}\`\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}\n\n📌 请扫描上方二维码完成支付\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付`,
-            parse_mode: "Markdown"
+            text: `📦 【选择支付方式】\n\n套餐: ${plan.name} (${plan.days} 天 / ${plan.price})\n\n请选择您方便的支付方式：`,
+            reply_markup: { inline_keyboard: methodBtns }
           })
         });
-        const photoJson = await photoRes.json().catch(() => ({}));
-        if (!photoJson.ok) {
-          // 收款码发送失败（如 file_id 失效）：
-          // 1. 清理已建订单 + 删除套餐选择消息
-          // 2. 自动从列表移除失效的收款码（自愈，避免买家反复卡死）
-          // 3. 通知管理员重新上传
-          try { await env.SUB_STORE.delete(`pending_${orderId}`); } catch (e) {}
-          try { await deleteTGMessage(STORE_BOT_TOKEN, cbChatId, cb.message.message_id); } catch (e) {}
-          try {
-            const qrList = await getPaymentQRs(env);
-            const newList = qrList.filter(q => q.fileId !== qrFileId);
-            if (newList.length !== qrList.length) {
-              await savePaymentQRs(env, newList);
-            }
-          } catch (e) {}
-          await sendTGMenu(STORE_BOT_TOKEN, cbChatId,
-            "⚠️ 收款码暂时不可用，请稍后重试或联系客服。", storeMenu);
-          try {
-            await sendTGText(ADMIN_BOT_TOKEN, ADMIN_ID,
-              `⚠️ 【收款码发送失败】\n买家 ChatID: ${cbChatId}\n套餐: ${plan.name}\n\n该收款码可能已失效，已自动移除。\n请用 /qrlist 查看剩余收款码，或 /setqr 重新上传。`);
-          } catch (e) {}
+        return new Response("OK");
+      }
+
+      // 选择支付方式 → 发送对应支付信息并创建订单
+      if (cbData.startsWith("paymethod_")) {
+        const parts = cbData.replace("paymethod_", "").split("_");
+        const payMethod = parts[0];
+        const planId = parts.slice(1).join("_");
+        const plans = await getPlans(env);
+        const plan = plans.find(p => p.id === planId);
+
+        if (!plan) {
+          await answerCallback(STORE_BOT_TOKEN, cb.id, "❌ 套餐不存在或已下架");
           return new Response("OK");
         }
 
-        // 存储待审订单（含套餐信息）
-        await env.SUB_STORE.put(`pending_${orderId}`, JSON.stringify({
-          chatId: cbChatId,
-          orderId,
-          time: Date.now(),
-          type: "new",
-          planId: plan.id,
-          planName: plan.name,
-          planDays: plan.days,
-          planPrice: plan.price
-        }), { expirationTtl: 1800 });
+        await answerCallback(STORE_BOT_TOKEN, cb.id, `已选 ${payMethodLabel(payMethod)}`);
+        await sendOrderPayInfo(env, cbChatId, plan, { id: payMethod, type: payMethod === "usdt" ? "text" : "qr" });
+        return new Response("OK");
+      }
 
-        // 通知管理员有新订单
-        try {
-          await sendTGText(ADMIN_BOT_TOKEN, ADMIN_ID,
-            `🛒 【新订单生成】\n• 订单号: ${orderId}\n• 套餐: ${plan.name} (${plan.days}天/${plan.price})\n• 买家 ChatID: ${cbChatId}\n\n等待买家付款后提交截图…`
-          );
-        } catch (e) {}
-
+      // 取消订单（支付信息消息上的取消按钮）
+      if (cbData.startsWith("cancel_order_")) {
+        const coOrderId = cbData.replace("cancel_order_", "");
+        await env.SUB_STORE.delete(`pending_${coOrderId}`);
+        await answerCallback(STORE_BOT_TOKEN, cb.id, "❌ 订单已取消");
+        try { await deleteTGMessage(STORE_BOT_TOKEN, cbChatId, cb.message.message_id); } catch (e) {}
         return new Response("OK");
       }
 
@@ -962,11 +946,10 @@ async function handleStoreBot(request, env) {
       }
 
       const plans = await getPlans(env);
-      const displayQR = await getDisplayQR(env);
-      const qrFileId = displayQR ? displayQR.fileId : null;
-
-      if (!qrFileId) {
-        await sendTGMenu(STORE_BOT_TOKEN, chatId, "⚠️ 系统收款码尚未配置，请联系管理员。", storeMenu);
+      // 检查是否配置了任何支付方式（微信/支付宝/USDT/通用收款码）
+      const availableMethods = await getAvailablePayMethods(env);
+      if (availableMethods.length === 0) {
+        await sendTGMenu(STORE_BOT_TOKEN, chatId, "⚠️ 系统暂未配置任何支付方式，请联系管理员。", storeMenu);
         return new Response("OK");
       }
 
@@ -1131,6 +1114,7 @@ async function handleStoreBot(request, env) {
     }
 
     // 收款码托管：管理员直接给前台 Bot 发图片 + 配文 /setqr（file_id 天然属于前台 Bot，100% 可用）
+    // 支持分类：/setqr wechat|alipay|default（默认 default）
     if (msg.photo && (text.includes("/setqr") || text === "🖼️ 设置收款码")) {
       // 仅管理员可操作
       if (msg.from.id !== ADMIN_ID) {
@@ -1138,12 +1122,20 @@ async function handleStoreBot(request, env) {
         return new Response("OK");
       }
       const fileId = msg.photo[msg.photo.length - 1].file_id;
-      // 加入多收款码列表
-      const list = await addPaymentQR(env, fileId, text.replace("/setqr", "").trim() || undefined);
-      await sendTGMenu(STORE_BOT_TOKEN, chatId, `✅ 【收款码已收录】第 ${list.length} 张！\n\n当前共 ${list.length} 张收款码，买家购买时随机展示。`, storeMenu);
+      // 解析类型（/setqr wechat /setqr alipay /setqr 或默认）
+      const sqrMatch = text.match(/\/setqr\s*([a-z]+)?/i);
+      const sqrType = (sqrMatch && sqrMatch[1]) ? sqrMatch[1].toLowerCase() : "default";
+      const typeLabel = sqrType === "wechat" ? "💳 微信" : (sqrType === "alipay" ? "💙 支付宝" : "📱 通用");
+      let list;
+      if (sqrType === "wechat" || sqrType === "alipay") {
+        list = await addPayQr(env, sqrType, fileId, text.replace(/\/setqr\s*[a-z]*/i, "").trim() || undefined);
+      } else {
+        list = await addPaymentQR(env, fileId, text.replace(/\/setqr\s*[a-z]*/i, "").trim() || undefined);
+      }
+      await sendTGMenu(STORE_BOT_TOKEN, chatId, `✅ 【${typeLabel}收款码已收录】第 ${list.length} 张！\n\n当前共 ${list.length} 张，买家选择${typeLabel}支付时展示。`, storeMenu);
       // 通知管理员
       try {
-        await sendTGText(ADMIN_BOT_TOKEN, ADMIN_ID, `✅ 收款码已通过前台 Bot 更新！当前共 ${list.length} 张`);
+        await sendTGText(ADMIN_BOT_TOKEN, ADMIN_ID, `✅ ${typeLabel}收款码已通过前台 Bot 更新！当前共 ${list.length} 张`);
       } catch (e) {}
       return new Response("OK");
     }
@@ -1243,10 +1235,11 @@ async function handleStoreBot(request, env) {
       ]
     };
 
-    // 通知管理员（含订单/套餐信息）
+    // 通知管理员（含订单/套餐/支付方式信息）
     // 买家昵称/用户名可能含 Markdown 特殊字符，必须先转义，否则 sendMessage 400 管理员收不到审核通知
     const orderLine = orderInfo
-      ? `• 订单号: ${escMD(orderInfo.orderId || "—")}\n• 套餐: ${escMD(orderInfo.planName || "默认")} (${escMD(orderInfo.planDays || "?")}天 / ${escMD(orderInfo.planPrice || "?")})\n`
+      ? `• 订单号: ${escMD(orderInfo.orderId || "—")}\n• 套餐: ${escMD(orderInfo.planName || "默认")} (${escMD(orderInfo.planDays || "?")}天 / ${escMD(orderInfo.planPrice || "?")})\n` +
+        (orderInfo.paymentMethod ? `• 支付方式: ${payMethodLabel(orderInfo.paymentMethod)}${orderInfo.paymentMethod === "usdt" && orderInfo.usdtAmount ? ` ≈ ${orderInfo.usdtAmount} USDT` : ""}\n` : "")
       : "";
     await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
       method: "POST",
@@ -1541,7 +1534,8 @@ async function handleAdminBot(request, env) {
               price: orderPlan.planPrice || "",
               time: Date.now(),
               uid: finalUid,
-              type: existingUid ? "renew" : "new"
+              type: existingUid ? "renew" : "new",
+              paymentMethod: orderPlan.paymentMethod || ""
             };
             await env.SUB_STORE.put(recordKey, JSON.stringify(record), { expirationTtl: 15552000 });
 
@@ -2272,6 +2266,19 @@ async function handleAdminBot(request, env) {
         }
       }
 
+      // 选择收款码类型 → 进入等待上传状态
+      else if (data.startsWith("setqr_type_")) {
+        const sqrType = data.replace("setqr_type_", "");
+        if (sqrType !== "wechat" && sqrType !== "alipay" && sqrType !== "default") {
+          replyAlert = "❌ 收款码类型无效";
+        } else {
+          await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "setqr", qrType: sqrType, chatId }));
+          const typeLabel = sqrType === "wechat" ? "💳 微信" : (sqrType === "alipay" ? "💙 支付宝" : "📱 通用");
+          replyText = `🖼️ 【上传收款码】\n类型: ${typeLabel}\n\n请现在发送收款码图片（无需配文）：\n\n可连续上传多张，/done 结束。`;
+          replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+        }
+      }
+
       // 删除分销商
       else if (data.startsWith("delreseller_")) {
         const rId = data.replace("delreseller_", "");
@@ -2946,7 +2953,8 @@ async function handleAdminBot(request, env) {
         let msg = `🧾 【收款流水】 (${recs.length} 笔)\n\n`;
         for (const r of recs.slice(0, 15)) {
           const timeStr = new Date(r.time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-          msg += `• ${r.orderId || "—"} (${r.type === "renew" ? "续费" : "新购"}${r.via === "card" ? "·卡密" : ""})\n  ${r.plan || ""} ${r.price || ""}\n  ${timeStr}\n`;
+          const payTag = r.paymentMethod && r.paymentMethod !== "default" ? ` · ${payMethodLabel(r.paymentMethod)}` : "";
+          msg += `• ${r.orderId || "—"} (${r.type === "renew" ? "续费" : "新购"}${r.via === "card" ? "·卡密" : ""}${payTag})\n  ${r.plan || ""} ${r.price || ""}\n  ${timeStr}\n`;
         }
         if (totalPrice > 0) msg += `\n💰 流水金额合计: ${totalPrice} 元`;
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, msg, MAIN_MENU);
@@ -2964,7 +2972,8 @@ async function handleAdminBot(request, env) {
         for (const k of orderKeys.slice(0, 20)) {
           const order = JSON.parse(await env.SUB_STORE.get(k));
           const timeStr = new Date(order.time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-          ordersText += `• ${k.replace("pending_", "")} (${order.type === "renew" ? "续费" : "新购"})\n  买家: ${order.chatId}\n  ${timeStr}\n`;
+          const payTag = order.paymentMethod && order.paymentMethod !== "default" ? ` · ${payMethodLabel(order.paymentMethod)}` : "";
+          ordersText += `• ${k.replace("pending_", "")} (${order.type === "renew" ? "续费" : "新购"}${payTag})\n  买家: ${order.chatId}\n  ${timeStr}\n`;
         }
         await sendTGMenu(ADMIN_BOT_TOKEN, chatId, ordersText, MAIN_MENU);
       }
@@ -3262,32 +3271,47 @@ async function handleAdminBot(request, env) {
       return new Response("OK");
     }
 
-    // 设置收款码：点击按钮直接进入等待上传状态
+    // 设置收款码：点击按钮 → 先选择收款码类型（微信/支付宝/通用）
     if (text === "🖼️ 设置收款码") {
-      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "setqr", chatId }));
-      const replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
+      const typeMarkup = {
+        inline_keyboard: [
+          [
+            { text: "💳 微信收款码", callback_data: "setqr_type_wechat" },
+            { text: "💙 支付宝收款码", callback_data: "setqr_type_alipay" }
+          ],
+          [
+            { text: "📱 通用收款码", callback_data: "setqr_type_default" }
+          ],
+          [{ text: "❌ 取消", callback_data: "cancel_action" }]
+        ]
+      };
       await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chatId,
-          text: "🖼️ 【上传收款码】\n请现在发送收款码图片（无需配文）：\n\n系统收录后将自动清除消息。",
-          reply_markup: replyMarkup
+          text: "🖼️ 【设置收款码】\n请选择要上传的收款码类型：\n\n💳 微信 = 买家选【微信】支付时展示\n💙 支付宝 = 买家选【支付宝】支付时展示\n📱 通用 = 旧版方式（仅其他都未配置时兑底）",
+          reply_markup: typeMarkup
         })
       });
       return new Response("OK");
     }
 
-    // 收款码指令：进入等待收款码状态
-    if (text === "/setqr") {
-      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "setqr", chatId }));
+    // 选择收款码类型 → 进入等待上传状态
+    if (text === "/setqr" || text.startsWith("/setqr ")) {
+      const sqrArg = text === "/setqr" ? "default" : text.replace("/setqr ", "").trim().toLowerCase();
+      if (sqrArg !== "wechat" && sqrArg !== "alipay" && sqrArg !== "default") {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 类型需为 wechat / alipay / default\n例：/setqr wechat 或 /setqr alipay", MAIN_MENU);
+        return new Response("OK");
+      }
+      await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "setqr", qrType: sqrArg, chatId }));
       const replyMarkup = { inline_keyboard: [[{ text: "❌ 取消", callback_data: "cancel_action" }]] };
       await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chatId,
-          text: "🖼️ 【上传收款码】\n请现在发送收款码图片（无需配文）：\n\n系统收录后将自动清除消息。",
+          text: `🖼️ 【上传收款码】\n类型: ${sqrArg === "wechat" ? "💳 微信" : (sqrArg === "alipay" ? "💙 支付宝" : "📱 通用")}\n\n请现在发送收款码图片（无需配文）：\n\n系统收录后将自动清除消息，可连续上传多张，/done 结束。`,
           reply_markup: replyMarkup
         })
       });
@@ -3861,7 +3885,7 @@ async function handleAdminBot(request, env) {
                       `**👥 用户管理**\n- 用户列表：查看所有用户及状态\n- 查找用户：/check UID 或 /check ChatID\n- 用户统计：活跃/过期/禁用分布\n- 即将到期：7天内到期用户\n- 手动开卡：为指定 ChatID 开通\n- 调整时长：给用户加/减天数\n- 用户备注：给用户打标签\n- 私信用户：一对一给用户发消息\n- 导出名单：导出全部用户信息\n\n` +
                       `**🎫 卡密管理**\n- 生成卡密：/gencard 数量 天数 价格\n- 买家自助兑换，无需审核\n- 卡密统计/查询/清理\n\n` +
                       `**📦 订单管理**\n- 待审核：查看付款凭证\n- 已处理：处理记录\n- 收款流水：订单流水与金额统计\n- 发货：凭证下方点【确认到账】\n\n` +
-                      `**⚙️ 系统设置**\n- 上游池：/addurl 链接 添加（可无限加）\n- 管理上游：/listurl /delurl /setdef\n- 合并节点：/merge on 合并所有上游节点\n- 节点管理：/nodes 查看 /nodeoff 禁用 /nodeon 启用\n- 收款码：点菜单后发图，自动转换\n- 价格：/price 内容\n- 天数：/days 数字\n- 公告：📢 发布公告\n\n` +
+                      `**⚙️ 系统设置**\n- 上游池：/addurl 链接 添加（可无限加）\n- 管理上游：/listurl /delurl /setdef\n- 合并节点：/merge on 合并所有上游节点\n- 节点管理：/nodes 查看 /nodeoff 禁用 /nodeon 启用\n- 支付方式：/paymethods 总览 \n  💳 微信: /setqr wechat 后发图\n  💙 支付宝: /setqr alipay 后发图\n  🪙 USDT: /setusdt 地址 [网络] + /setrate 汇率\n  📱 通用: /setqr default 后发图\n- 价格：/price 内容\n- 天数：/days 数字\n- 公告：📢 发布公告\n\n` +
                       `**📣 群发通知**\n- 给所有用户发消息\n\n` +
                       `**💰 分销系统**\n- 创建分销商（自动生成推广链接）\n- 设置佣金比例\n- 查看推广点击与佣金\n- 删除分销商\n\n` +
                       `**📊 系统概览**\n- 用户/订单/卡密/流水全统计\n\n` +
@@ -3888,12 +3912,14 @@ async function handleAdminBot(request, env) {
     }
 
     // 收款码托管：等待状态下直接收图（无需配文），或传统方式（图片+配文 /setqr）
-    // 支持多张：可连续上传多张，全部收录
+    // 支持多张：可连续上传多张，全部收录；支持按类型（wechat/alipay/default）分类存储
     if (msg.photo && (text.includes("/setqr") || (actionState && actionState.mode === "setqr"))) {
       const adminFileId = msg.photo[msg.photo.length - 1].file_id;
+      // 确定上传类型（默认 default 兼容旧版）
+      const uploadType = (actionState && actionState.qrType) || "default";
       // 不清除 setqr 状态（允许连续上传多张），除非配文带了 /done
       if (!text.includes("/done")) {
-        await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "setqr", chatId }));
+        await env.SUB_STORE.put("admin_action_state", JSON.stringify({ mode: "setqr", qrType: uploadType, chatId }));
       } else {
         await env.SUB_STORE.delete("admin_action_state");
       }
@@ -3906,11 +3932,17 @@ async function handleAdminBot(request, env) {
       try {
         const storeFileId = await convertQRForStoreBot(adminFileId);
         if (storeFileId) {
-          const list = await addPaymentQR(env, storeFileId, text.replace("/done", "").trim() || undefined);
+          const typeLabel = uploadType === "wechat" ? "💳 微信" : (uploadType === "alipay" ? "💙 支付宝" : "📱 通用");
+          let list;
+          if (uploadType === "wechat" || uploadType === "alipay") {
+            list = await addPayQr(env, uploadType, storeFileId, text.replace("/done", "").trim() || undefined);
+          } else {
+            list = await addPaymentQR(env, storeFileId, text.replace("/done", "").trim() || undefined);
+          }
           const doneText = text.includes("/done") ? "\n（已完成上传）" : "";
           const continueText = text.includes("/done") ? "" : "\n\n可继续上传下一张，或发送 /done 完成";
           await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
-            `✅ 【收款码已收录】第 ${list.length} 张！\n\n当前共 ${list.length} 张收款码${doneText}${continueText}`,
+            `✅ 【${typeLabel}收款码已收录】第 ${list.length} 张！\n\n当前共 ${list.length} 张${doneText}${continueText}`,
             text.includes("/done") ? MAIN_MENU : { keyboard: [[{ text: "✅ 完成上传" }], [{ text: "🏠 返回主菜单" }]], resize_keyboard: true, persistent: true });
         } else {
           await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 收款码转换失败，请重新上传。", MAIN_MENU);
@@ -3924,33 +3956,134 @@ async function handleAdminBot(request, env) {
     // 完成上传（/done 或按钮）
     if (text === "✅ 完成上传" || text === "/done") {
       await env.SUB_STORE.delete("admin_action_state");
-      const list = await getPaymentQRs(env);
+      const wechatQrs = await getPayQrs(env, "wechat");
+      const alipayQrs = await getPayQrs(env, "alipay");
+      const defaultQrs = await getPaymentQRs(env);
       await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
-        `✅ 【收款码上传完成】\n当前共 ${list.length} 张收款码。\n\n买家购买时将${list.length > 1 ? "随机展示其中一张" : "展示这张"}。\n\n可用 /qrlist 查看，/qrdel 序号 删除。`,
+        `✅ 【收款码上传完成】\n\n💳 微信: ${wechatQrs.length} 张\n💙 支付宝: ${alipayQrs.length} 张\n📱 通用: ${defaultQrs.length} 张\n\n用 /paymethods 查看支付方式配置总览。`,
         MAIN_MENU);
       return new Response("OK");
     }
 
-    // 查看收款码列表
-    if (text === "/qrlist") {
-      const list = await getPaymentQRs(env);
-      if (list.length === 0) {
-        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有收款码\n发送 /setqr 后上传即可添加", MAIN_MENU);
+    // 查看收款码列表（/qrlist 或 /qrlist wechat|alipay）
+    if (text === "/qrlist" || text.startsWith("/qrlist ")) {
+      const qlType = text === "/qrlist" ? "default" : text.replace("/qrlist ", "").trim().toLowerCase();
+      if (qlType === "default") {
+        const list = await getPaymentQRs(env);
+        const wechatQrs = await getPayQrs(env, "wechat");
+        const alipayQrs = await getPayQrs(env, "alipay");
+        if (list.length === 0 && wechatQrs.length === 0 && alipayQrs.length === 0) {
+          await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "📭 当前没有收款码\n点【🖼️ 设置收款码】选择类型上传，或 /setqr wechat|alipay", MAIN_MENU);
+        } else {
+          let msg = `🖼️ 【收款码总览】\n\n💳 微信: ${wechatQrs.length} 张 → /qrlist wechat\n💙 支付宝: ${alipayQrs.length} 张 → /qrlist alipay\n📱 通用: ${list.length} 张\n\n支付方式总览: /paymethods`;
+          await sendTGMenu(ADMIN_BOT_TOKEN, chatId, msg, MAIN_MENU);
+        }
+      } else if (qlType === "wechat" || qlType === "alipay") {
+        const list = await getPayQrs(env, qlType);
+        if (list.length === 0) {
+          await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `📭 ${qlType === "wechat" ? "💳 微信" : "💙 支付宝"}收款码为空\n用 /setqr ${qlType} 后发图即可添加`, MAIN_MENU);
+        } else {
+          let msg = `🖼️ 【${qlType === "wechat" ? "微信" : "支付宝"}收款码】(${list.length} 张)\n\n`;
+          list.forEach((q, i) => {
+            msg += `${i + 1}. ${q.note || "收款码"}\n  添加于 ${new Date(q.addedAt).toLocaleDateString("zh-CN")}\n`;
+          });
+          msg += `\n删除：/delsetqr ${qlType} 序号`;
+          await sendTGMenu(ADMIN_BOT_TOKEN, chatId, msg, MAIN_MENU);
+        }
       } else {
-        let msg = `🖼️ 【收款码列表】(${list.length} 张)\n\n`;
-        list.forEach((q, i) => {
-          msg += `${i + 1}. ${q.note || "收款码"}\n  添加于 ${new Date(q.addedAt).toLocaleDateString("zh-CN")}\n`;
-        });
-        msg += `\n删除：/qrdel 序号`;
-        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, msg, MAIN_MENU);
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 类型需为 wechat 或 alipay\n例：/qrlist wechat", MAIN_MENU);
       }
       return new Response("OK");
     }
 
-    // 删除收款码
+    // 删除收款码（/qrdel 序号 删除通用收款码）
     if (text.startsWith("/qrdel")) {
       const idx = parseInt(text.replace("/qrdel", "").trim()) - 1;
       const r = await removePaymentQR(env, idx);
+      await sendTGMenu(ADMIN_BOT_TOKEN, chatId, r.ok ? `✅ ${r.msg}` : `❌ ${r.msg}`, MAIN_MENU);
+      return new Response("OK");
+    }
+
+    // ===== 多支付方式管理 =====
+    // /setusdt 地址 [网络]：设置 USDT 收款地址
+    if (text.startsWith("/setusdt ")) {
+      const usdtParts = text.replace("/setusdt ", "").trim().split(/\s+/);
+      const usdtAddress = usdtParts[0];
+      const usdtNetwork = usdtParts[1] || "TRC20";
+      if (!usdtAddress || !/^[A-Za-z0-9]{10,}$/.test(usdtAddress)) {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ USDT 地址格式无效\n用法：/setusdt 地址 [网络=TRC20]\n例：/setusdt TXXXX... TRC20", MAIN_MENU);
+        return new Response("OK");
+      }
+      await saveUsdtInfo(env, usdtAddress, usdtNetwork);
+      await logAction(env, "设置USDT地址", `${usdtNetwork}`);
+      await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
+        `🪙 【USDT 已配置】\n\n• 地址: \`${usdtAddress}\`\n• 网络: ${usdtNetwork}\n\n买家购买时将显示此地址收款。\n\n可用 /setrate 7.2 设置汇率，/paymethods 查看全部支付方式。`,
+        MAIN_MENU);
+      return new Response("OK");
+    }
+
+    // 查看当前 USDT 配置
+    if (text === "/usdtinfo") {
+      const usdt = await getUsdtInfo(env);
+      const rate = await getUsdtRate(env);
+      if (!usdt) {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "🪙 【USDT 配置】\n未配置\n\n用法：/setusdt 地址 [网络=TRC20]", MAIN_MENU);
+      } else {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId,
+          `🪙 【USDT 配置】\n\n• 地址: \`${usdt.address}\`\n• 网络: ${usdt.network}\n• 汇率: 1 USDT = ¥${rate}\n\n修改：/setusdt 新地址 网络\n改汇率：/setrate 数字`,
+          MAIN_MENU);
+      }
+      return new Response("OK");
+    }
+
+    // /setrate 数字：设置 USDT 汇率
+    if (text.startsWith("/setrate ")) {
+      const rate = parseFloat(text.replace("/setrate ", "").trim());
+      if (isNaN(rate) || rate <= 0 || rate > 100) {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 汇率无效（需大于0的数字）\n例：/setrate 7.2", MAIN_MENU);
+        return new Response("OK");
+      }
+      await saveUsdtRate(env, rate);
+      await logAction(env, "设置USDT汇率", `1 USDT = ¥${rate}`);
+      await sendTGMenu(ADMIN_BOT_TOKEN, chatId, `💱 【USDT 汇率已设置】\n1 USDT = ¥${rate}\n\n买家选 USDT 支付时，套餐金额将按此汇率折算。`, MAIN_MENU);
+      return new Response("OK");
+    }
+
+    // /paymethods：查看支付方式配置总览
+    if (text === "/paymethods") {
+      const wechatQrs = await getPayQrs(env, "wechat");
+      const alipayQrs = await getPayQrs(env, "alipay");
+      const defaultQrs = await getPaymentQRs(env);
+      const usdt = await getUsdtInfo(env);
+      const rate = await getUsdtRate(env);
+      const msg = `💳 【支付方式配置】\n\n` +
+        `💳 微信收款码: ${wechatQrs.length} 张 ${wechatQrs.length > 0 ? "✅" : "❌ 未配置"}\n` +
+        `💙 支付宝收款码: ${alipayQrs.length} 张 ${alipayQrs.length > 0 ? "✅" : "❌ 未配置"}\n` +
+        `🪙 USDT: ${usdt ? `✅ ${usdt.network} (1USDT=¥${rate})` : "❌ 未配置"}\n` +
+        `📱 旧通用收款码: ${defaultQrs.length} 张（仅当上面都未配置时兜底）\n\n` +
+        `**配置方法：**\n` +
+        `• 微信: /setqr wechat 后发图\n` +
+        `• 支付宝: /setqr alipay 后发图\n` +
+        `• USDT: /setusdt 地址 [网络]\n` +
+        `• 汇率: /setrate 7.2`;
+      await sendTGMenu(ADMIN_BOT_TOKEN, chatId, msg, MAIN_MENU);
+      return new Response("OK");
+    }
+
+    // /delsetqr 类型 序号：删除指定类型的收款码
+    if (text.startsWith("/delsetqr ")) {
+      const dsp = text.replace("/delsetqr ", "").trim().split(/\s+/);
+      const dsType = dsp[0];
+      const dsIdx = parseInt(dsp[1]) - 1;
+      if (dsType !== "wechat" && dsType !== "alipay") {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 类型需为 wechat 或 alipay\n例：/delsetqr wechat 1", MAIN_MENU);
+        return new Response("OK");
+      }
+      if (isNaN(dsIdx) || dsIdx < 0) {
+        await sendTGMenu(ADMIN_BOT_TOKEN, chatId, "❌ 序号无效\n例：/delsetqr wechat 1", MAIN_MENU);
+        return new Response("OK");
+      }
+      const r = await removePayQr(env, dsType, dsIdx);
       await sendTGMenu(ADMIN_BOT_TOKEN, chatId, r.ok ? `✅ ${r.msg}` : `❌ ${r.msg}`, MAIN_MENU);
       return new Response("OK");
     }
@@ -5081,6 +5214,203 @@ async function getDisplayQR(env) {
   const idx = Math.floor(Math.random() * list.length);
   return list[idx];
 }
+
+// ==================== 多支付方式（微信 / 支付宝 / USDT） ====================
+// 分方式收款码：wechat/alipay 各存一个列表（兼容旧版统合收款码作为默认方式兜底）
+async function getPayQrs(env, method) {
+  const key = method === "wechat" ? "pay_qrs_wechat" : "pay_qrs_alipay";
+  const str = await env.SUB_STORE.get(key);
+  if (str) {
+    try {
+      const arr = JSON.parse(str);
+      if (Array.isArray(arr) && arr.length > 0) return arr;
+    } catch (e) {}
+  }
+  return [];
+}
+
+async function savePayQrs(env, method, list) {
+  await env.SUB_STORE.put(method === "wechat" ? "pay_qrs_wechat" : "pay_qrs_alipay", JSON.stringify(list));
+}
+
+async function addPayQr(env, method, fileId, note) {
+  const list = await getPayQrs(env, method);
+  list.push({ fileId, note: note || `${method === "wechat" ? "微信" : "支付宝"}收款码${list.length + 1}`, addedAt: Date.now() });
+  await savePayQrs(env, method, list);
+  return list;
+}
+
+async function removePayQr(env, method, index) {
+  const list = await getPayQrs(env, method);
+  if (isNaN(index) || index < 0 || index >= list.length) return { ok: false, msg: "序号无效" };
+  list.splice(index, 1);
+  await savePayQrs(env, method, list);
+  return { ok: true, msg: `已删除第 ${index + 1} 个收款码` };
+}
+
+// USDT 收款地址配置
+async function getUsdtInfo(env) {
+  const str = await env.SUB_STORE.get("pay_usdt");
+  if (str) {
+    try {
+      const obj = JSON.parse(str);
+      if (obj && obj.address) return obj;
+    } catch (e) {}
+  }
+  return null;
+}
+
+async function saveUsdtInfo(env, address, network) {
+  await env.SUB_STORE.put("pay_usdt", JSON.stringify({ address, network: network || "TRC20", updatedAt: Date.now() }));
+}
+
+// USDT 汇率（1 USDT = N 人民币），未配置默认 7.2
+async function getUsdtRate(env) {
+  const str = await env.SUB_STORE.get("usdt_rate");
+  if (str) {
+    const r = parseFloat(str);
+    if (r > 0) return r;
+  }
+  return 7.2;
+}
+
+async function saveUsdtRate(env, rate) {
+  await env.SUB_STORE.put("usdt_rate", String(rate));
+}
+
+// 人民币金额 → USDT 金额（向上取整到 2 位小数，避免少收）
+function cnyToUsdt(cny, rate) {
+  if (!cny || cny <= 0 || !rate || rate <= 0) return null;
+  return Math.ceil((cny / rate) * 100) / 100;
+}
+
+// 提取字符串中第一个金额数字（如 "30元/月，年付240元" → 30）
+function extractAmount(str) {
+  const m = String(str ?? "").match(/\d+(?:\.\d+)?/);
+  return m ? parseFloat(m[0]) : NaN;
+}
+
+// 获取买家可见的可用支付方式列表
+async function getAvailablePayMethods(env) {
+  const methods = [];
+  if ((await getPayQrs(env, "wechat")).length > 0) methods.push({ id: "wechat", label: "💳 微信", type: "qr" });
+  if ((await getPayQrs(env, "alipay")).length > 0) methods.push({ id: "alipay", label: "💙 支付宝", type: "qr" });
+  if (await getUsdtInfo(env)) methods.push({ id: "usdt", label: "🪙 USDT", type: "text" });
+  // 兜底：旧的统合收款码（payment_qrs）视为"默认"方式
+  if (methods.length === 0 && (await getPaymentQRs(env)).length > 0) {
+    methods.push({ id: "default", label: "📱 扫码支付", type: "qr" });
+  }
+  return methods;
+}
+
+// 支付方式标签
+function payMethodLabel(id) {
+  return id === "wechat" ? "💳 微信" : (id === "alipay" ? "💙 支付宝" : (id === "usdt" ? "🪙 USDT" : (id === "default" ? "📱 扫码支付" : id)));
+}
+
+// 发送对应支付方式并创建订单（微信/支付宝发收款码，USDT 发地址）
+async function sendOrderPayInfo(env, chatId, plan, method) {
+  // 频控：同一买家 5 秒内只能下一单（订单创建的唯一入口，防刷）
+  if (!(await rateLimit(env, "order", chatId, 5))) {
+    await sendTGText(STORE_BOT_TOKEN, chatId, "⏳ 操作太快啦，请稍后再试");
+    return null;
+  }
+  const orderId = genOrderId();
+  const methodLabel = payMethodLabel(method.id);
+  const cancelMarkup = { inline_keyboard: [[{ text: "❌ 取消订单", callback_data: `cancel_order_${orderId}` }]] };
+
+  if (method.id === "usdt") {
+    const usdt = await getUsdtInfo(env);
+    if (!usdt) {
+      await sendTGText(STORE_BOT_TOKEN, chatId, "⚠️ USDT 支付未配置，请联系管理员。");
+      return null;
+    }
+    const rate = await getUsdtRate(env);
+    const cnyPrice = extractAmount(plan.price);
+    const usdtAmount = cnyToUsdt(cnyPrice, rate);
+    await fetch(`https://api.telegram.org/bot${STORE_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: `🪙 【USDT 支付】\n\n• 订单编号: \`${orderId}\`\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}${usdtAmount ? ` ≈ **${usdtAmount} USDT**（汇率 1 USDT = ¥${rate}）` : ""}\n\n📮 收款地址:\n\`${usdt.address}\`\n\n🔗 网络: ${usdt.network}\n\n📌 请务必使用 ${usdt.network} 网络转账 **${usdtAmount || "对应"} USDT**，金额与套餐一致\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付`,
+        parse_mode: "Markdown",
+        reply_markup: cancelMarkup
+      })
+    });
+    await env.SUB_STORE.put(`pending_${orderId}`, JSON.stringify({
+      chatId, orderId, time: Date.now(), type: "new",
+      planId: plan.id, planName: plan.name, planDays: plan.days, planPrice: plan.price,
+      paymentMethod: "usdt", usdtAmount, usdtRate: rate
+    }), { expirationTtl: 1800 });
+    try {
+      await sendTGText(ADMIN_BOT_TOKEN, ADMIN_ID,
+        `🛒 【新订单生成】\n• 订单号: ${orderId}\n• 套餐: ${plan.name} (${plan.days}天/${plan.price})\n• 支付方式: 🪙 USDT${usdtAmount ? ` ≈ ${usdtAmount} USDT` : ""}\n• 买家 ChatID: ${chatId}\n\n等待买家付款后提交截图…`);
+    } catch (e) {}
+    return orderId;
+  }
+
+  // 微信/支付宝/默认：发收款码
+  let qrFileId = null;
+  let qrList = null;
+  if (method.id === "wechat") qrList = await getPayQrs(env, "wechat");
+  else if (method.id === "alipay") qrList = await getPayQrs(env, "alipay");
+  else qrList = await getPaymentQRs(env); // default 兜底用统合收款码
+
+  if (qrList && qrList.length > 0) {
+    qrFileId = qrList[Math.floor(Math.random() * qrList.length)].fileId;
+  }
+  if (!qrFileId) {
+    await sendTGText(STORE_BOT_TOKEN, chatId, "⚠️ 该支付方式暂时不可用，请选择其他方式或联系客服。");
+    return null;
+  }
+
+  const photoRes = await fetch(`https://api.telegram.org/bot${STORE_BOT_TOKEN}/sendPhoto`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      photo: qrFileId,
+      caption: `💎 【自助下单结算】\n\n• 订单编号: \`${orderId}\`\n• 支付方式: ${methodLabel}\n• 套餐: ${plan.name} (${plan.days} 天)\n• 金额: ${plan.price}\n\n📌 请使用${methodLabel}扫描下方二维码完成支付\n💬 付款后请直接在此发送【转账截图】\n\n⏰ 请在 30 分钟内完成支付`,
+      parse_mode: "Markdown",
+      reply_markup: cancelMarkup
+    })
+  });
+  const photoJson = await photoRes.json().catch(() => ({}));
+  if (!photoJson.ok) {
+    // 收款码发送失败：自动移除该失效收款码（自愈）
+    try {
+      if (method.id === "wechat" || method.id === "alipay") {
+        const l = await getPayQrs(env, method.id);
+        const newL = l.filter(q => q.fileId !== qrFileId);
+        if (newL.length !== l.length) await savePayQrs(env, method.id, newL);
+      } else {
+        const l = await getPaymentQRs(env);
+        const newL = l.filter(q => q.fileId !== qrFileId);
+        if (newL.length !== l.length) await savePaymentQRs(env, newL);
+      }
+    } catch (e) {}
+    await sendTGText(STORE_BOT_TOKEN, chatId, "⚠️ 收款码暂时不可用，请稍后重试或联系客服。");
+    try {
+      await sendTGText(ADMIN_BOT_TOKEN, ADMIN_ID,
+        `⚠️ 【收款码发送失败】\n买家 ChatID: ${chatId}\n套餐: ${plan.name}\n支付方式: ${methodLabel}\n\n该收款码可能已失效，已自动移除。`);
+    } catch (e) {}
+    return null;
+  }
+
+  await env.SUB_STORE.put(`pending_${orderId}`, JSON.stringify({
+    chatId, orderId, time: Date.now(), type: "new",
+    planId: plan.id, planName: plan.name, planDays: plan.days, planPrice: plan.price,
+    paymentMethod: method.id
+  }), { expirationTtl: 1800 });
+
+  try {
+    await sendTGText(ADMIN_BOT_TOKEN, ADMIN_ID,
+      `🛒 【新订单生成】\n• 订单号: ${orderId}\n• 套餐: ${plan.name} (${plan.days}天/${plan.price})\n• 支付方式: ${methodLabel}\n• 买家 ChatID: ${chatId}\n\n等待买家付款后提交截图…`);
+  } catch (e) {}
+  return orderId;
+}
+
 
 // 发送普通文本（Markdown 解析失败时自动降级纯文本重发，避免特殊字符导致 400）
 async function sendTGText(token, chatId, text) {
